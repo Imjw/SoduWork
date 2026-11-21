@@ -29,7 +29,7 @@ from app.schema_migrations import (
 
 OLD_MERGE = "0067_merge_release_account_ownership"
 CANONICAL_MERGE = "0067_merge_account_ownership"
-CURRENT_HEAD = "0092_task_text_storage"
+CURRENT_HEAD = "0094_merge_proxy_peer_identity"
 
 
 class IntegratedMigrationHistoryTests(unittest.TestCase):
@@ -108,6 +108,9 @@ class IntegratedMigrationHistoryTests(unittest.TestCase):
         script = ScriptDirectory.from_config(_config())
         self.assertEqual(script.get_heads(), [CURRENT_HEAD])
         expected = {
+            "0094_merge_proxy_peer_identity": ("0093_proxy_usage_shadow", "0093_device_peer_identity"),
+            "0093_device_peer_identity": "0092_task_text_storage",
+            "0093_proxy_usage_shadow": "0092_task_text_storage",
             "0092_task_text_storage": "0091_domain_sort_validation",
             "0091_domain_sort_validation": "0090_requirement_creator",
             "0090_requirement_creator": "0089_schedule_model_source",
@@ -337,6 +340,61 @@ class IntegratedMigrationHistoryTests(unittest.TestCase):
 
 
 class SQLiteMergeCompatibilityTests(unittest.TestCase):
+    def test_proxy_and_peer_merge_preserves_data_from_either_installed_branch(self):
+        proxy = "0093_proxy_usage_shadow"
+        peer = "0093_device_peer_identity"
+        for installed in ((proxy,), (peer,), (proxy, peer)):
+            with self.subTest(installed=installed), tempfile.TemporaryDirectory(prefix="soduwork-peer-merge-") as folder:
+                filename = Path(folder) / "test.db"
+                environment = {
+                    "DATABASE_URL": "sqlite+aiosqlite:///" + filename.as_posix(),
+                    "SODUWORK_DATA_ROOT": str(Path(folder) / "data"),
+                    "SODUWORK_ENV": "development",
+                    "CLUSTER_REDIS_URL": "",
+                }
+                with patch.dict(os.environ, environment):
+                    get_settings.cache_clear()
+                    try:
+                        config = _config()
+                        for parent in installed:
+                            command.upgrade(config, parent)
+
+                        old_peers, old_usage = [], []
+                        with closing(sqlite3.connect(filename)) as database, database:
+                            self.assertEqual({row[0] for row in database.execute(
+                                "SELECT version_num FROM alembic_version")}, set(installed))
+                            if peer in installed:
+                                database.execute("INSERT INTO client_peer_identity (client_id,role,public_key) "
+                                                 "VALUES ('fixture-device','desktop','fixture-public-key')")
+                                old_peers = database.execute("SELECT * FROM client_peer_identity").fetchall()
+                            if proxy in installed:
+                                database.execute(
+                                    "INSERT INTO proxy_usage_observation (id,client_id,user_id,agent,provider,model,"
+                                    "funding,protocol,outcome,evidence,provider_response_hash,counts) "
+                                    "VALUES ('fixture-usage','fixture-device','fixture-user','runner','provider','model',"
+                                    "'managed','http','success','reported','fixture-digest',?)",
+                                    (json.dumps({"input": 17}),))
+                                old_usage = database.execute("SELECT * FROM proxy_usage_observation").fetchall()
+
+                        for _ in range(2):
+                            command.upgrade(config, "head")
+                            with closing(sqlite3.connect(filename)) as database:
+                                self.assertEqual(database.execute(
+                                    "SELECT version_num FROM alembic_version").fetchall(), [(CURRENT_HEAD,)])
+                                self.assertEqual(database.execute(
+                                    "SELECT * FROM client_peer_identity").fetchall(), old_peers)
+                                self.assertEqual(database.execute(
+                                    "SELECT * FROM proxy_usage_observation").fetchall(), old_usage)
+                                self.assertEqual([row[1] for row in database.execute(
+                                    "PRAGMA table_info(client_peer_identity)") if row[5]], ["client_id"])
+                                index_name = "ix_proxy_usage_observation_recorded_at"
+                                self.assertIn(index_name, [row[1] for row in database.execute(
+                                    "PRAGMA index_list(proxy_usage_observation)")])
+                                self.assertEqual([row[2] for row in database.execute(
+                                    f"PRAGMA index_info({index_name})")], ["recorded_at"])
+                    finally:
+                        get_settings.cache_clear()
+
     def test_only_the_known_noop_marker_is_normalized(self):
         cases = (
             (["0066_schedule_account_ownership"], False,

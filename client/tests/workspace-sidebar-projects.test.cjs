@@ -40,6 +40,17 @@ test('moving a mobile project member out and back removes aliases and preserves 
   assert.deepEqual(ids(s.view([one,two]).recent).sort(), ['cloud-sync-one','cloud-sync-two']);
 });
 
+test('canonical cloud project members reopen a handoff retaining its native conversation ID', () => {
+  const f = fixture(), store = f.create();
+  const cloud = { id: 'original-native-id', cloud: true, taskId: 'handoff-task', title: 'Cloud handoff' };
+  store.applyRemoteProject({ id: 'project-handoff', name: 'Shared', chatIds: ['cloud-task:handoff-task'] });
+  assert.deepEqual(ids(store.view([cloud]).projects[0].items), [cloud.id]);
+  store.remember([cloud]);
+  assert.deepEqual(ids(f.create().view([]).projects[0].items), [cloud.id]);
+  store.move(cloud, 'recent', '', [cloud]);
+  assert.deepEqual(Array.from(store.get().projects[0].chatIds), []);
+});
+
 test('task aliases do not guess among multiple projections or match unrelated native conversations', () => {
   const s = fixture().create();
   s.applyRemoteProject({id:'project-mobile',name:'Mobile',chatIds:['cloud-task:task-one']});
@@ -82,6 +93,7 @@ test('account project sync imports groups, preserves PC folders and applies only
   const f = fixture(), store = f.create();
   const id = store.saveProject({name: '本地项目', folders: ['C:/work']});
   store.fileChat('native-chat', id, {id: 'native-chat', title: '会话'});
+  store.fileChat('cloud-one', id, {id: 'cloud-one', cloud: true, taskId: 'task-one'});
   const remote = new Map(), writes = [], errors = [];
   const sync = f.api.projectSync({store, storage: f.storage, key: 'one', error: e => errors.push(e), api: {
     conversationProjects: async () => ({items: [...remote.values()]}),
@@ -91,11 +103,13 @@ test('account project sync imports groups, preserves PC folders and applies only
     },
   }});
   await sync.run(); assert.equal(writes.length, 1);
+  assert.deepEqual(Array.from(remote.get(id).chatIds), ['cloud-task:task-one']);
   remote.set(id, {...remote.get(id), name: '手机改名', revision: 2});
-  remote.set('project-phone', {id: 'project-phone', name: '手机项目', chatIds: [], revision: 1});
+  remote.set('project-phone', {id: 'project-phone', name: '手机项目', chatIds: ['cloud-task:phone-task'], revision: 1});
   await sync.run();
   const project = store.get().projects.find(p => p.id === id);
   assert.equal(project.name, '手机改名'); assert.deepEqual(Array.from(project.folders), ['C:/work']);
+  assert.ok(project.chatIds.includes('native-chat'));
   remote.delete('project-phone'); await sync.run();
   assert.ok(store.get().projects.some(p => p.id === 'project-phone'), 'missing records do not imply deletion');
   remote.set('project-phone', {id: 'project-phone', name: '手机项目', chatIds: [], revision: 2, deleted: true});
@@ -106,6 +120,7 @@ test('account project sync imports groups, preserves PC folders and applies only
 test('project sync preserves edits made in flight and does not publish application groups', async () => {
   const f = fixture(), store = f.create(), remote = new Map();
   const id = store.saveProject({name: '初始'});
+  store.fileChat('cloud-one', id, {id: 'cloud-one', cloud: true, taskId: 'task-one'});
   store.recordAppChat('app-local', '应用专用', a);
   let release, pause = true;
   const sync = f.api.projectSync({store, storage: f.storage, key: 'one', api: {
@@ -128,7 +143,8 @@ test('deleting a chat while another project saves cannot restore its old project
     if (autoSync) void sync.run();
   }});
   const first = store.saveProject({name: 'First'}), second = store.saveProject({name: 'Second'});
-  store.fileChat('deleted-chat', second, {id: 'deleted-chat', title: 'Deleted conversation'});
+  store.fileChat('first-cloud', first, {id: 'first-cloud', cloud: true, taskId: 'first-task'});
+  store.fileChat('deleted-chat', second, {id: 'deleted-chat', title: 'Deleted conversation', cloud: true, taskId: 'deleted-task'});
   sync = f.api.projectSync({store, storage: f.storage, key: 'one', error: e => errors.push(e), api: {
     conversationProjects: async () => ({items: [...remote.values()]}),
     saveConversationProject: async (id, body) => {
@@ -152,7 +168,7 @@ test('deleting a chat while another project saves cannot restore its old project
 });
 
 test('project push during a pending read is reconciled once without recursive remote-write loops', async () => {
-  const f = fixture(); let sync, release, calls = 0, remote = {id: 'project-phone', name: 'Old', revision: 1, chatIds: []};
+  const f = fixture(); let sync, release, calls = 0, remote = {id: 'project-phone', name: 'Old', revision: 1, chatIds: ['cloud-task:phone-task']};
   const store = f.api.create({storage: f.storage, key: 'one', onChange: () => { void sync?.run(); }});
   sync = f.api.projectSync({store, storage: f.storage, key: 'one', api: {
     conversationProjects: async () => {
@@ -171,6 +187,7 @@ test('project push during a pending read is reconciled once without recursive re
 test('project revision conflict and account changes cannot overwrite local groups', async () => {
   const f = fixture(), store = f.create(), errors = [];
   const id = store.saveProject({name: '保留本地'});
+  store.fileChat('cloud-one', id, {id: 'cloud-one', cloud: true, taskId: 'task-one'});
   const sync = f.api.projectSync({store, storage: f.storage, key: 'one', error: e => errors.push(e), api: {
     conversationProjects: async () => ({items: []}),
     saveConversationProject: async () => {throw Error('409 conflict');},

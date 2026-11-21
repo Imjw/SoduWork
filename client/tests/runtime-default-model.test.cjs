@@ -84,6 +84,31 @@ test('Pi and Runner resume never bypass an unavailable device-owned default', as
   assert.equal(calls[1][6].ignoreAgentPreference, undefined);
 });
 
+test('a fresh segment requires the current account selection even when it carries earlier dialogue', async t => {
+  const calls = [];
+  let reply = { ok: false, code: 'MODEL_UNAVAILABLE', reason: 'Model unavailable' };
+  t.mock.method(require('../main/local-model-privacy.cjs'), 'prepare', async () => {});
+  const pi = require('../main/pi-session/session-open').create({
+    loadSdk: async () => ({ ok: true, sdk: {} }), _openTiming() {},
+    goalContract: { normalize: () => ({ intent: 'chat' }) },
+    modelConfig: { prepare: async (_app, _identity, name, options) => { calls.push({ name, ...options }); return reply; } },
+  });
+  const adapter = createRunnerRuntimeAdapter({ runtimeSpec: runtimeCatalog.runtime('qwen'),
+    runnerRuntime: { rpc: async () => { throw Error('Unexpected execution'); } },
+    modelConfig: { fetchModel: async (_identity, name, _timeout, _fetch, _reload, _agent, options) => {
+      calls.push({ name, ...options }); return reply;
+    } } });
+  const selected = { ref: 'fresh', cwd: os.tmpdir(), modelName: 'selected-now', resumedConversation: true, startDeviceSegment: true };
+  for (const substitute of [false, true]) {
+    if (substitute) reply = { ok: true, model: { id: 'different-default' } };
+    assert.equal((await pi.open({ app: {}, identity, ...selected })).ok, false);
+    await assert.rejects(adapter.createSession({ runtimeId: 'fresh', identity, native: { runner: { openOptions: selected } } }),
+      error => error.code === 'RUNNER_MODEL_UNAVAILABLE');
+  }
+  assert.equal(calls.length, 4);
+  assert.ok(calls.every(call => call.name === 'selected-now' && call.allowHistorical === false));
+});
+
 test('every Runner gateway adapter resolves its own default at open and after model changes; account runtimes bypass it', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'soduwork-runtime-default-'));
   try {

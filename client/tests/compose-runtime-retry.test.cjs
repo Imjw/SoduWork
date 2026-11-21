@@ -65,6 +65,24 @@ function fixture(first, options = {}) {
     expire: () => { for (const fn of [...timers.values()]) fn(); } };
 }
 
+test('a pending manual switch fences submissions and a superseded selection cannot commit a prepared model', async () => {
+  const f = fixture(() => ({ ok: true, runtimes: fullCatalog }));
+  await f.runtime.ready();
+  const first = deferred(), commits = [];
+  f.context.ComposeModelPicker = { prepareRuntimeSwitch: async row => {
+    if (row.id === 'qwen') await first.promise;
+    return { preservesModel: true, apply: () => commits.push(row.id) };
+  } };
+  const qwen = f.select('qwen'); await flush();
+  const waiting = f.runtime.pendingSelection();
+  assert.ok(waiting);
+  await f.select('opencode'); first.resolve(); await qwen;
+  assert.equal(await waiting, false);
+  assert.deepEqual(commits, ['opencode']);
+  assert.equal(f.runtime.value(), 'opencode');
+  assert.equal(f.runtime.pendingSelection(), null);
+});
+
 test('runtime maintenance follows the selected location and never falls back from cloud to local', () => {
   const f = fixture(() => ({ok:true,runtimes:fullCatalog})), calls = [];
   f.context.openAgentsEntry = () => calls.push('agents');

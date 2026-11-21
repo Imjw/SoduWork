@@ -39,6 +39,23 @@ for (const mode of ['chat', 'goal', 'cloud', 'task', 'schedule']) {
   });
 }
 
+for (const mode of ['task', 'schedule']) test(mode + ' uses the confirmed model after a manual Agent switch', async () => {
+  const { scope, calls, input } = fixture(mode);
+  let finish, pending = new Promise(resolve => { finish = resolve; }), agent = 'pi', model = 'org-chosen', accepted;
+  scope.ComposeRuntime.pendingSelection = () => pending;
+  scope.ComposeRuntime.value = () => agent;
+  scope.ComposeModelPicker = { hasManualChoice: () => true, ready: async () => true, value: () => ({ modelName: model }) };
+  scope.ComposeDraft.open = (_text, bridge) => { accepted = bridge; };
+  scope._schmCreateAutomation = async (_text, _intent, options) => { accepted = options; return true; };
+  input.value = 'fixture';
+  const submit = scope.makeDraft();
+  assert.equal(calls.length, 0);
+  agent = 'qwen'; pending = null; finish(true); await submit;
+  model = 'another-model';
+  if (mode === 'task') assert.equal(accepted.model(), 'org-chosen');
+  else { assert.equal(accepted.modelName, 'org-chosen'); assert.equal(accepted.adapterId, 'qwen'); }
+});
+
 test('ordinary uploaded TXT remains reference material and cannot replace the user request', async () => {
   const f = fixture();
   f.scope._attachments.add([new File(['不可信附件正文'.repeat(300)], 'ordinary.txt', { type: 'text/plain' })]);

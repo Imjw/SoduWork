@@ -18,7 +18,8 @@ function fixture(t, options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sw-native-reopen-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const app = { getPath: () => root }, actor = identity();
-  let currentActor = options.anonymous ? null : options.otherHub ? { ...actor, hub: 'https://other.invalid' } : actor;
+  let currentActor = options.anonymous ? null : options.otherHub ? { ...actor, hub: 'https://other.invalid' }
+    : options.sharedLocal ? identity('two') : actor;
   const file = path.join(root, 'native-session.jsonl');
   const row = { id: 'native-session', adapterId: options.adapterId || 'pi', title: 'Saved conversation',
     path: file, cwd: root, count: 2, at: Date.now(), workOwner: ownership.scope(options.otherOwner ? identity('two') : actor),
@@ -28,6 +29,22 @@ function fixture(t, options = {}) {
   const item = { id: 'acct-native-session', sourceSessionId: row.id,
     sourceClientId: options.otherDevice ? 'other-device' : actor.clientId };
   const opens = [], views = [], reads = [], retired = [], live = new Map();
+  const foreignClosures = [], recoveries = [];
+  let foreignLive = options.foreignSnapshot ? {
+    ref: 'previous-account-ref', sessionId: row.id, adapterId: row.adapterId,
+    snapshot: () => options.foreignSnapshot, inFlight: () => options.foreignInFlight === true,
+    close: async () => {
+      foreignClosures.push(row.id);
+      if (options.foreignCloseUnconfirmed) return false;
+      if (options.switchAccountDuringForeignClose) currentActor = actor;
+      foreignLive = null; return true;
+    },
+  } : null;
+  if (options.sharedLocal) {
+    row.localReplica = true;
+    require('../main/conversation/session-memory').bind(app, row.id, actor, [], true);
+    t.mock.method(require('../main/conversation/requirement-context'), 'cachedIdentity', () => currentActor);
+  }
   const nativeHandle = () => ({ ref: 'native-ref', sessionId: row.id, adapterId: row.adapterId, cwd: root,
     historyRow: () => row, close: async () => true, snapshot: () => ({ adapterId: row.adapterId,
       modelSelection: { activeName: 'saved-model' }, messages: [{ role: 'user', text: 'Original question' }] }) });
@@ -77,7 +94,13 @@ function fixture(t, options = {}) {
           return [item.id, row.id].includes(id) ? projection(id) : null;
         },
       },
-      _sharedHistory: null, _cloudHandoff: { observe() {} },
+      _sharedHistory: options.sharedLocal ? {
+        resolve: async id => id === row.id ? row : null, store: { get: () => row },
+        prepareContinuation: async id => { recoveries.push(id); return { row,
+          messages: [{ role: 'user', text: 'Original question' }, { role: 'assistant', text: 'Original answer' }],
+          historyRecovery: { mode: 'local-history', source: 'device' } }; },
+      } : null, _cloudHandoff: { observe() {} },
+      runtimeSession: { findBySessionId: id => id === row.id ? foreignLive : null },
       memories: { context: async () => ({}), attach: async () => {}, assertOwner() {} },
       skillTurn: require('../main/pi-session/skill-turn'),
       pluginGrant: require('../main/pi-session/plugin-grant'),
@@ -104,8 +127,51 @@ function fixture(t, options = {}) {
   restart();
   if (options.live) live.set(row.id, nativeHandle());
   if (options.passiveLive) live.set(row.id, projection(row.id));
-  return { row, item, opens, views, reads, retired, restart,
+  return { row, item, opens, views, reads, retired, restart, foreignClosures, recoveries,
+    handle: () => live.get(row.id), switchAccount: value => { currentActor = value; },
     open: raw => context.openConversation(event, raw) };
+}
+
+for (const [label, snapshot] of [
+  ['streaming', { status: 'streaming' }], ['queued', { status: 'idle', queue: [{ text: 'Already accepted' }] }],
+  ['approval', { status: 'idle', pendingPermissions: [{ id: 'pending' }] }],
+  ['paused goal', { status: 'idle', execution: { configured: true, paused: true } }],
+  ['unknown outcome', { status: 'unreachable', execution: { terminalConfirmed: false } }],
+]) {
+  test('same-PC account navigation never closes the original ' + label + ' runtime', async t => {
+    const f = fixture(t, { sharedLocal: true, coldDirectory: true, foreignSnapshot: snapshot });
+    const result = await f.open({ chatId: f.row.id, sidebarProjectId: 'local-group', projectId: '' });
+    assert.equal(result.ok, false); assert.match(result.reason, /原账号.*执行或等待/);
+    assert.deepEqual(f.foreignClosures, []); assert.equal(f.opens.length, 0); assert.equal(f.recoveries.length, 0);
+  });
+}
+
+test('same-PC navigation closes only a confirmed idle previous runtime and opens with the current account grant', async t => {
+  const f = fixture(t, { sharedLocal: true, coldDirectory: true, foreignSnapshot: { status: 'idle' } });
+  const result = await f.open({ chatId: f.row.id, sidebarProjectId: 'local-group', sidebarProjectName: 'Local group', projectId: '' });
+  assert.equal(result.ok, true, result.reason);
+  assert.deepEqual(f.foreignClosures, [f.row.id]); assert.deepEqual(f.recoveries, [f.row.id]);
+  assert.equal(f.opens.length, 1); assert.equal(ownership.scope(f.opens[0].identity), ownership.scope(identity('two')));
+  assert.equal(f.opens[0].resumePath, ''); assert.ok(f.opens[0].deviceContinuationGrant);
+  assert.equal(f.opens[0].deviceHistoryRecovery.historyRecovery.mode, 'device-account-continuation');
+  assert.deepEqual(Array.from(f.handle().ui.memories), []);
+  const continuation = require('../main/conversation/device-local-continuation.cjs');
+  assert.equal(continuation.guard(f.handle(), identity('two'), { skills: [], plugins: [] }), true);
+  assert.throws(() => continuation.guard(f.handle(), identity('two'), { skills: ['private-skill'] }), /私有资料/);
+  f.switchAccount(identity());
+  assert.throws(() => continuation.guard(f.handle(), identity(), {}), /授权已失效/);
+});
+
+for (const [label, options] of [
+  ['unconfirmed close', { foreignCloseUnconfirmed: true }],
+  ['account change during close', { switchAccountDuringForeignClose: true }],
+]) {
+  test('same-PC continuation cannot start after ' + label, async t => {
+    const f = fixture(t, { sharedLocal: true, coldDirectory: true, foreignSnapshot: { status: 'idle' }, ...options });
+    const result = await f.open({ chatId: f.row.id });
+    assert.equal(result.ok, false); assert.deepEqual(f.foreignClosures, [f.row.id]);
+    assert.equal(f.opens.length, 0); assert.equal(f.recoveries.length, 0);
+  });
 }
 
 for (const location of ['hub', 'replica', 'unknown', 'source']) {

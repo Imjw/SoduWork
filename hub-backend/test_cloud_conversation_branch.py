@@ -95,45 +95,15 @@ class CloudBranchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('continue on desktop', created['options']['text'])
         self.assertEqual(created['options']['targetRunnerId'], 'desktop-2')
 
-    async def test_account_projection_can_continue_from_another_owned_device(self):
-        row = types.SimpleNamespace(
-            id='account-conversation-1', owner_user_id='user-1',
-            source_client_id='desktop-1', deleted=False, revision=7,
-            title='电脑上的工作', source_session_id='desktop-session', storage_mode='legacy',
-        )
-
-        class Result:
-            def all(self):
-                return []
-
-        class Session:
-            async def scalar(self, _query):
-                return row
-
-            async def scalars(self, _query):
-                return Result()
-
-        created = {}
-
-        async def create(_session, client, request_id, options, files):
-            created.update(client=client, request_id=request_id, options=options, files=files)
-            return {'ok': True, 'taskId': 'branched-task', 'ref': 'branched-ref'}
-
-        with patch('app.services.cloud_conversations.create', new=AsyncMock(side_effect=create)):
-            result = await branch_account_conversation(
-                'branch-from-phone', {
-                    'accountConversationId': row.id,
-                    'expectedRevision': 7,
-                    'instruction': '在我的电脑上继续整理',
-                    'agentId': 'pi',
-                    'targetRunnerId': 'desktop-1',
-                }, types.SimpleNamespace(id='mobile-1', user_ref='user-1'), Session())
-
-        self.assertEqual(result['taskId'], 'branched-task')
-        self.assertEqual(created['client'].id, 'mobile-1')
-        self.assertEqual(created['options']['targetRunnerId'], 'desktop-1')
-        self.assertEqual(created['options']['userText'], '在我的电脑上继续整理')
-        self.assertEqual(created['files'], [])
+    async def test_retired_account_branch_rejects_every_device_without_creating_cloud_work(self):
+        from fastapi import HTTPException
+        with patch('app.services.cloud_conversations.create', new=AsyncMock()) as create:
+            for device in ('desktop-1', 'mobile-1', 'foreign-device'):
+                with self.assertRaises(HTTPException) as retired:
+                    await branch_account_conversation('branch-from-device', types.SimpleNamespace(id=device, user_ref='user-1'))
+                self.assertEqual(retired.exception.status_code, 410)
+                self.assertEqual(retired.exception.detail['code'], 'LOCAL_CONVERSATION_BRANCH_DISABLED')
+            create.assert_not_awaited()
 
 
 if __name__ == '__main__':

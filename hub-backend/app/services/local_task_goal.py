@@ -246,46 +246,16 @@ def _validation_tool(row: dict) -> bool:
                     "grep", "glob", "search", "web_search"}
 
 
-def _native_results(run: dict, event: object) -> list[dict]:
-    """Small terminal projections for native transports without normalized out rows."""
-    if not isinstance(event, dict):
-        return []
-    cli, result = run.get("cli"), []
-    if cli == "codex" and event.get("type") == "item.completed":
-        item = event.get("item")
-        if not isinstance(item, dict) or not item.get("id"):
-            return []
-        kind, status = item.get("type"), item.get("status")
-        if kind == "command_execution":
-            success = status == "completed" and type(item.get("exit_code")) is int and item["exit_code"] == 0
-            result.append({"kind": "out", "tool": kind, "callId": item["id"],
-                           "isError": not success, "full": str(item.get("aggregated_output") or "")[:20000]})
-        elif kind == "file_change":
-            result.append({"kind": "out", "tool": kind, "callId": item["id"],
-                           "isError": status != "completed", "full": json.dumps(item.get("changes") or [])[:20000]})
-        elif kind == "mcp_tool_call":
-            result.append({"kind": "out", "tool": kind, "callId": item["id"],
-                           "isError": status != "completed" or bool(item.get("error")),
-                           "full": json.dumps(item.get("result") or {}, ensure_ascii=False)[:20000]})
-        elif kind == "web_search":
-            # Completion closes this native tool, but no result receipt is exposed.
-            result.append({"kind": "out", "tool": kind, "callId": item["id"], "isError": True})
-    elif cli == "opencode" and event.get("type") == "tool_use":
-        part = event.get("part")
-        state = part.get("state") if isinstance(part, dict) else None
-        if isinstance(state, dict) and state.get("status") in {"completed", "error"}:
-            result.append({"kind": "out", "tool": part.get("tool"),
-                           "callId": part.get("callID") or part.get("callId") or part.get("id"),
-                           "isError": state["status"] != "completed" or bool(state.get("error")),
-                           "full": str(state.get("output") or "")[:20000]})
-    return result
-
-
 def observe(run: dict, rows: list[dict], native_event: object = None) -> None:
     if not enabled(run) or run["goalState"]["status"] not in _ACTIVE:
         return
     state = run["goalState"]
-    for row in [*rows, *_native_results(run, native_event)]:
+    from . import runtime_messages
+    # Direct native observations can arrive before the display stream is written.
+    received = {row["callId"] for row in rows if isinstance(row, dict) and row.get("kind") == "out"
+                and isinstance(row.get("callId"), str)}
+    terminal = (row for row in runtime_messages.native_tool_results(run, native_event) if row["callId"] not in received)
+    for row in [*rows, *terminal]:
         if not isinstance(row, dict):
             continue
         if state["status"] == "reviewing" and row.get("kind") == "say":

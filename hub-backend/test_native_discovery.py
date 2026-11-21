@@ -194,30 +194,28 @@ class QueryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.statements), 1)
         self.assertIn("LIMIT", self.statements[0])
 
-    async def test_empty_new_relay_poll_is_one_read_and_no_config_update(self):
+    async def test_retired_relay_poll_reads_no_history_and_writes_no_presence(self):
         for _ in range(4):
             self.reset()
             result = await relay.poll(self.pc, self.session, {"discoveryProtocol": 1})
             self.assertEqual(result["requests"], [])
-            self.assertEqual(len(self.statements), 1)
+            self.assertEqual(len(self.statements), 0)
             self.assertEqual(self.commits, [])
         self.assertEqual(self.pc.config, {"keep": "unchanged"})
-        self.assertTrue(await relay.available(self.pc))
 
-    async def test_legacy_lease_remains_compatible_and_is_throttled_across_sessions(self):
+    async def test_retired_legacy_poll_is_empty_across_sessions_without_config_mutation(self):
+        self.reset()
         await relay.poll(self.pc, self.session)
-        self.assertEqual(len(self.commits), 1)
-        self.assertTrue(await relay.available(self.pc))
-        stamp = self.pc.config[relay.PREFIX]["at"]
-        # A different request/worker reads the same DB timestamp, not a local
-        # last-written map. PostgreSQL serializes due renewals with FOR UPDATE.
+        self.assertEqual(self.statements, [])
+        self.assertEqual(self.commits, [])
+        self.assertNotIn(relay.PREFIX, self.pc.config)
         async with self.factory() as other:
             pc = await other.get(Client, "pc")
             self.reset()
             await relay.poll(pc, other)
-            self.assertEqual(len(self.statements), 1)
+            self.assertEqual(len(self.statements), 0)
             self.assertEqual(self.commits, [])
-            self.assertEqual(pc.config[relay.PREFIX]["at"], stamp)
+            self.assertNotIn(relay.PREFIX, pc.config)
             self.assertEqual(pc.config["keep"], "unchanged")
 
     async def test_screen_poll_does_not_let_expired_history_hide_live_grants(self):
@@ -248,7 +246,7 @@ class QueryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.session.scalar(select(func.count()).select_from(RemoteScreenGrant).where(
             RemoteScreenGrant.state == "expired")), 100)
 
-    async def test_twenty_relay_jobs_use_one_batched_source_lookup(self):
+    async def test_twenty_legacy_relay_jobs_are_not_read_or_released_after_upgrade(self):
         for index in range(20):
             self.session.add(AccountConversation(id=f"c{index}", owner_user_id="alice", source_client_id="pc",
                 source_session_id=f"native{index}", source_epoch="e", source_revision=1, revision=1, state="idle"))
@@ -259,8 +257,8 @@ class QueryTests(unittest.IsolatedAsyncioTestCase):
         await self.session.commit()
         self.reset()
         result = await relay.poll(self.pc, self.session, {"discoveryProtocol": 1})
-        self.assertEqual(len(result["requests"]), 20)
-        self.assertEqual(len(self.statements), 2)
+        self.assertEqual(result["requests"], [])
+        self.assertEqual(self.statements, [])
         self.assertEqual(self.commits, [])
 
 

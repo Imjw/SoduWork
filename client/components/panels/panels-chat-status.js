@@ -485,6 +485,10 @@
     }
     function statusHtml(busy) {
       const current = state();
+      if (current.snap?.historyRecovery?.bodyMissing || current.snap?.historyRecovery?.incomplete ||
+          current.snap?.localReplica && !current.snap.execution?.canContinueOnDevice)
+        return '<div data-chat-node="runtime-status" class="nstatus show"><span class="nstatus-copy">' +
+          escape(tx(current.snap.historyRecovery?.reason || '这条历史当前仅可查看')) + '</span></div>';
       if (!current.pending && waiting(current.snap)) return '<div data-chat-node="runtime-status" class="nstatus show">' +
         '<span class="nstatus-copy">' + escape(work(current.snap, '', current.ref)) + '</span></div>';
       return '<div data-chat-node="runtime-status" class="nstatus' + (busy ? ' show' : '') + '">' +

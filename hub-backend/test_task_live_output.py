@@ -55,6 +55,39 @@ class LiveOutputTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(value['full'], rows[0]['full'])
         self.assertEqual(value['callId'], 'call')
 
+    def test_native_tool_receipts_are_visible_in_regular_runner_history(self):
+        cases = [
+            ('codex', {'type': 'item.completed', 'item': {'type': 'command_execution',
+             'id': 'native-1', 'status': 'completed', 'exit_code': 0, 'aggregated_output': 'test output'}}),
+            ('opencode', {'type': 'tool_use', 'part': {'tool': 'bash', 'id': 'part-1', 'callID': 'native-1',
+             'state': {'status': 'completed', 'input': {'command': 'test'}, 'output': 'test output'}}}),
+        ]
+        for cli, event in cases:
+            with self.subTest(cli=cli):
+                rows = local_stream._items_from(event, {'cli': cli})
+                self.assertEqual([(r['kind'], r['callId']) for r in rows], [('do', 'native-1'), ('out', 'native-1')])
+                self.assertEqual(rows[1]['full'], 'test output')
+                self.assertIs(rows[1]['isError'], False)
+
+    def test_incomplete_native_tools_and_private_mcp_fields_do_not_become_public_results(self):
+        without_exit = {'id': 'call', 'type': 'command_execution', 'status': 'completed'}
+        for event in ({'type': 'item.started', 'item': without_exit}, {'type': 'item.completed', 'item': without_exit}):
+            self.assertEqual(runtime_messages.native_tool_results({'cli': 'codex'}, event), [])
+        item = {'id': 'mcp', 'type': 'mcp_tool_call', 'status': 'completed', 'result': {
+            'content': [{'type': 'text', 'text': 'visible'}], '_meta': {'private': 'not-for-history'}}}
+        rows = local_stream._items_from({'type': 'item.completed', 'item': item}, {'cli': 'codex'})
+        self.assertEqual(rows[-1]['full'], 'visible')
+        self.assertNotIn('not-for-history', str(rows))
+
+    def test_acp_plan_updates_preserve_text_without_starting_an_execution(self):
+        from app.services import acp_bridge
+        bridge = acp_bridge.AcpBridge([], '.', 'qwen', 'readonly')
+        with patch.object(acp_bridge, '_emit') as emit:
+            bridge._update({'sessionUpdate': 'plan', 'entries': [{'content': 'Inspect the fixture'}]})
+        rows = local_stream._items_from(emit.call_args.args[0], {'cli': 'qwen'})
+        self.assertNotIn('do', [r['kind'] for r in rows])
+        self.assertIn('Inspect the fixture', rows[0]['text'])
+
     def test_structured_cloud_preview_metadata_is_public(self):
         value = execution_sessions._event_api(SimpleNamespace(
             seq=2, kind='out', tool='bash', text='ready', at=None,

@@ -13,6 +13,42 @@ from runner_main import Runner
 
 
 class RunnerUsageReceiptTests(unittest.TestCase):
+    def test_unreconciled_or_partial_acp_counts_create_no_charge(self):
+        from app.services import acp_bridge
+        valid = {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15}
+        with patch.object(acp_bridge, "_emit") as emitted:
+            for usage in (None, {"used": 1234}, {"totalTokens": 15}, {**valid, "inputTokens": True},
+                          {**valid, "totalTokens": 16}, {**valid, "thoughtTokens": -1},
+                          {**valid, "cachedReadTokens": 11}, {**valid, "totalTokens": 2**63}):
+                acp_bridge._emit_usage(usage)
+            emitted.assert_not_called()
+
+    def test_acp_prompt_reply_becomes_one_owned_receipt(self):
+        from app.services import acp_bridge
+        usage = {"inputTokens": 12, "outputTokens": 5, "cachedReadTokens": 7,
+                 "cachedWriteTokens": 2, "thoughtTokens": 3, "totalTokens": 26}
+        for local in (False, True):
+            with self.subTest(local=local), tempfile.TemporaryDirectory() as root:
+                run = {"cli": "dsh", "cfg": {"llm": {"model": "fixture", "localOnly": local}},
+                       "state": "running", "ws": root, "seq": 0, "lines": []}
+                acp = acp_bridge.AcpBridge([], root, "dsh", "workspace", session_id="saved")
+                replies = [{"protocolVersion": 1, "agentCapabilities": {"loadSession": True}},
+                           {"usage": usage}, {"stopReason": "end_turn", "usage": usage}]
+                with patch.object(local_base, "_STORE", root), patch.dict(local_base._RUNS, {"fixture": run}), \
+                        patch.object(acp, "start"), patch.object(acp.access, "apply"), \
+                        patch.object(acp, "request", side_effect=replies), patch.object(acp_bridge, "_emit",
+                            side_effect=lambda row: local_stream._on_line("fixture", json.dumps(row), {})):
+                    self.assertEqual(acp.run("fixture"), 0)
+                self.assertEqual(len(run.get("usageReceipts", [])), 1)
+                totals = runner_usage_receipts.public_usage(run)
+                if local:
+                    self.assertEqual(totals, {})
+                else:
+                    self.assertEqual((totals["input_tokens"], totals["output_tokens"], totals["total_tokens"]),
+                                     (21, 5, 26))
+                    self.assertEqual(totals["reasoning_tokens"], 3)
+                    self.assertFalse(totals["cost_known"])
+
     def test_unknown_legacy_model_identity_requires_positive_public_ownership(self):
         legacy = {"cli": "qwen", "model": "private-wire", "usage": {"total": 99}}
         raw = {"model": "private-wire", "error": "old private-wire diagnostic", "usage": {"total": 99}}

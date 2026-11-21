@@ -39,6 +39,36 @@ test('local history follows the current account and rejects conflicting ownershi
   assert.deepEqual(access.visible(f.app, rows).map(row => row.id), []);
   assert.throws(() => access.assertOwner(f.app, id, access.actor(f.app), rows[0]), /当前账号/);
 });
+test('only the desktop can read a different account’s verified ordinary native chat on the same PC', t => {
+  const f = fixture(t), original = identity(), next = identity('two');
+  const row = { id: 'alice', localReplica: true, adapterId: 'pi', workOwner: scope(original),
+    creator: { account: 'one', hub: original.hub } };
+  f.switch(next);
+  const actor = access.actor(f.app);
+  const read = (entry = row) => access.assertDeviceReadable(f.app, entry.id, actor, entry);
+  assert.deepEqual(read(), { sharedOnDevice: true, originalOwner: scope(original) });
+  assert.throws(() => access.assertReadable(f.app, row.id, actor, row));
+  assert.throws(() => access.assertLocalMutation(f.app, row.id, actor, row));
+  assert.throws(() => access.assertOwner(f.app, row.id, actor, row));
+  for (const accountOnly of [{ cloud: true }, { taskId: 'a-task' }, { acceptanceReview: true },
+    { deviceTransferId: 'receipt' }, { cached: true }, { importDigest: 'digest' }, { sourceSessionId: 'remote' },
+    { locationMode: 'remote' }, { historyProtection: 'account' }, { creator: { account: 'one', hub: 'https://other.test' } }])
+    assert.throws(() => read({ ...row, ...accountOnly }));
+  assert.throws(() => read({ ...row, workOwner: scope(next) }));
+  assert.throws(() => read({ id: 'unknown', localReplica: true }));
+  assert.deepEqual(read({ ...row, creator: undefined }), { sharedOnDevice: true, originalOwner: scope(original) },
+    'An existing empty memory binding preserves the original Hub without changing the creator');
+  f.write('session-memory-bindings', 'alias', { owner: scope(original), hub: original.hub, ids: ['private-memory'] });
+  assert.throws(() => read({ ...row, historyAliasIds: ['alias'] }));
+  memories.bind(f.app, 'formerly-ordinary', original, ['selected-memory']);
+  assert.throws(() => read({ ...row, id: 'formerly-ordinary' }));
+  f.write('session-memory-bindings', 'auto-memory', { owner: scope(original), hub: original.hub,
+    ids: [], historyProtection: 'account' });
+  assert.throws(() => read({ ...row, id: 'auto-memory' }));
+  f.switch(null);
+  assert.throws(() => access.assertDeviceReadable(f.app, row.id, access.actor(f.app), row));
+});
+
 test('owned history survives expiry but stays isolated across accounts and signout', t => {
   const f = fixture(t), rows = ['alice', 'bob', 'unbound'].map(id => ({ id, count: 1,
     ...(id === 'unbound' ? {} : { creator: { account: id === 'alice' ? 'one' : 'two', hub: identity().hub } }) }));

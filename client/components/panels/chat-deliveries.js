@@ -96,17 +96,20 @@
   }
   function isSettled(snapshot = {}) {
     const execution = snapshot.execution || {};
+    // Recorded tools cannot execute in a passive view. Their missing receipts
+    // still govern continuation, but do not block reading verified files.
+    const passive = snapshot.localReplica === true && execution.readOnly === true;
     const latestUser = (Array.isArray(snapshot.messages) ? snapshot.messages : []).findLastIndex(message => message?.role === 'user');
     return (!snapshot.status || ['idle', 'completed', 'done'].includes(snapshot.status)) &&
       !snapshot.deliveryPending && !snapshot.pendingUi && !execution.running && !execution.stopped &&
       !execution.limitRequest && !['executing', 'implementing', 'reviewing', 'repairing', 'blocked'].includes(execution.quality?.phase) &&
-      !(Array.isArray(snapshot.tools) ? snapshot.tools : []).some(tool => tool?.state === 'running' && (Number(tool.after) || 0) >= latestUser);
+      (passive || !(Array.isArray(snapshot.tools) ? snapshot.tools : []).some(tool => tool?.state === 'running' && (Number(tool.after) || 0) >= latestUser));
   }
   function joinPreviews(message, card) {
     // Evidence remains visible above the delivery without entering its saved files.
     if (!card) return;
     [...message.querySelectorAll('.noutput-image')]
-      .filter(node => node.closest('.nmsg.ai,[data-task-stream]') === message && !node.closest('.nacceptance-result'))
+      .filter(node => node.closest('.nmsg.ai,[data-task-stream]') === message && !node.closest('.nacceptance-result,.noutput-gallery'))
       .forEach(node => message.insertBefore(node, card));
   }
   function fileList(doc, rows, originalOf) {
@@ -146,6 +149,10 @@
     if (!root || !ref || !isSettled(snapshot)) return;
     const summaryOnly = snapshot.delivery?.presentation === 'summary' || snapshot.deliveryPresentation === 'summary' ||
       snapshot.deliveryMode === 'git' || snapshot.cloudHandoff?.deliveryMode === 'git';
+    if (snapshot.localReplica === true && !snapshot.cloudHandoff?.taskId) {
+      if (!summaryOnly) decorateHistoryFiles(root, files);
+      return;
+    }
     const cloudTaskId = String(snapshot.cloudHandoff?.taskId || '');
     const artifactUrl = artifactUrlFor(
       snapshot.artifactUrl || snapshot.cloudHandoff?.artifactUrl || snapshot.execution?.artifactUrl ||
@@ -224,6 +231,33 @@
       if (existing?.classList.contains('ndelivery-preview-only')) existing.remove();
     }
     while (groups.size > 120) { const old = groups.keys().next().value; groups.delete(old); if (!jobs.get(old)?.busy) jobs.delete(old); }
+  }
+  function decorateHistoryFiles(root, files) {
+    const remaining = new Map(groupFiles(files, '').filter(file => file.artifactId && !file.deleted &&
+      file.primary === true && file.role !== 'supporting').map(file => [key(file), file]));
+    const append = (owner, rows) => {
+      if (!rows.length) return;
+      const doc = root.ownerDocument, card = doc.createElement('section');
+      card.className = 'ndelivery';
+      if (owner === root) card.dataset.chatNode = 'history-deliverables';
+      const details = doc.createElement('details'); details.open = true; details.className = 'ndelivery-files';
+      const summary = doc.createElement('summary'); summary.textContent = tx(owner === root ? '会话成果' : text.title);
+      details.append(summary, fileList(doc, rows, file => file)); card.append(details); owner.append(card);
+    };
+    // An older index can identify a session's file without recording its turn.
+    // Keep such files at session level and expose only the authorized open action.
+    const replies = [...root.querySelectorAll('.nmsg.ai,[data-task-stream]')].reverse();
+    for (const reply of replies) {
+      if (!remaining.size) break;
+      if (reply.dataset.deliveryFinal === 'false' || reply.querySelector('.nacceptance-result')) continue;
+      const rows = [];
+      for (const node of reply.querySelectorAll('[data-open-app],[data-output-image],[data-output-video]')) {
+        const id = node.dataset.openApp || node.dataset.outputImage || node.dataset.outputVideo;
+        if (remaining.has(id)) { rows.push(remaining.get(id)); remaining.delete(id); }
+      }
+      append(reply, rows);
+    }
+    append(root, [...remaining.values()]);
   }
   function canPreviewSaved(group, delivery) {
     if (!delivery || group.files.length !== 1) return false;

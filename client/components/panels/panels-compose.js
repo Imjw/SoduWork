@@ -100,10 +100,12 @@
     const view = _composeViewSeq, directory = JSON.stringify([_workspace.direct, _workspace.dir]);
     const owner = global.SoduWorkAPI?.taskStorageKey?.('ops');
     const execution = global.ComposeExecution?.revision?.();
+    const switching = global.ComposeRuntime?.pendingSelection?.();
+    if (switching && !await switching) return false;
     const selection = global.ComposeDirectoryPreferences?.selectionRevision?.();
     const adapter = global.ComposeRuntime?.value?.();
     const ready = await global.ComposeDirectoryPreferences?.ready();
-    return ready !== false && view === _composeViewSeq && directory === JSON.stringify([_workspace.direct, _workspace.dir]) &&
+    return ready !== false && !global.ComposeRuntime?.pendingSelection?.() && view === _composeViewSeq && directory === JSON.stringify([_workspace.direct, _workspace.dir]) &&
       (selection === undefined ? adapter === global.ComposeRuntime?.value?.()
         : selection === global.ComposeDirectoryPreferences?.selectionRevision?.()) &&
       owner === global.SoduWorkAPI?.taskStorageKey?.('ops') && execution === global.ComposeExecution?.revision?.();
@@ -460,10 +462,12 @@
     }
     if (_pluginResolveBusy) return false;
     if (!await _readyDirectoryPreferences()) return false;
+    const choiceRevision = global.ComposeDirectoryPreferences?.selectionRevision?.();
+    const sameChoice = () => choiceRevision === global.ComposeDirectoryPreferences?.selectionRevision?.();
     const selectedSkills = [...new Set(_skillPicker?.selected() || [])];
     if (global.ComposeExecution?.value() === 'cloud') {
       const cloudViewSeq = _composeViewSeq;
-      const accepted = await global.ComposeExecution.start({ text, isCurrent: () => cloudViewSeq === _composeViewSeq,
+      const accepted = await global.ComposeExecution.start({ text, isCurrent: () => cloudViewSeq === _composeViewSeq && sameChoice(),
         inputPreparation: intentOptions?.inputPreparation,
         prepare: async () => {
           await _pluginSelectTask;
@@ -498,7 +502,7 @@
     // Preparation can await permission, plugins and models. Changing location
     // or Agent invalidates this send; keep its draft instead of starting the
     // previously selected local runtime under the new visible controls.
-    const current = () => currentEntry() && global.ComposeExecution?.value?.() !== 'cloud' &&
+    const current = () => currentEntry() && sameChoice() && global.ComposeExecution?.value?.() !== 'cloud' &&
       directory === JSON.stringify([_workspace.direct, _workspace.dir]) &&
       global.ComposeExecution?.revision?.() === executionRevision && (global.ComposeRuntime?.value?.() || 'pi') === adapterId;
     await global.ComposeModelPicker?.ready?.();
@@ -602,12 +606,14 @@
       global.petSay?.('云端需求请在需求池安排执行'); return;
     }
     if (!await _readyDirectoryPreferences()) return;
+    const choiceRevision = global.ComposeDirectoryPreferences?.selectionRevision?.();
     const view = _composeViewSeq, owner = global.SoduWorkAPI?.taskStorageKey?.('ops') || '';
     const revision = global.ComposeExecution?.revision?.(), setup = _setupRevision;
     const adapterId = global.ComposeRuntime?.value?.() || 'pi';
     const current = () => view === _composeViewSeq && owner === (global.SoduWorkAPI?.taskStorageKey?.('ops') || '') &&
       p.classList.contains('show');
-    const ready = () => current() && p.dataset.stage === 'compose' && setup === _setupRevision &&
+    const ready = () => current() && choiceRevision === global.ComposeDirectoryPreferences?.selectionRevision?.() &&
+      p.dataset.stage === 'compose' && setup === _setupRevision &&
       revision === global.ComposeExecution?.revision?.() && global.ComposeExecution?.value?.() !== 'cloud' &&
       adapterId === (global.ComposeRuntime?.value?.() || 'pi');
     if (button) button.disabled = true;
@@ -697,7 +703,9 @@
     const submitOwner = global.SoduWorkAPI?.taskStorageKey?.('ops') || '';
     const submitAdapter = global.ComposeRuntime?.value?.() || 'pi';
     const submitExecution = global.ComposeExecution?.revision?.();
+    const choiceRevision = global.ComposeDirectoryPreferences?.selectionRevision?.();
     const currentWorkEntry = () => submitViewSeq === _composeViewSeq &&
+      choiceRevision === global.ComposeDirectoryPreferences?.selectionRevision?.() &&
       submitOwner === (global.SoduWorkAPI?.taskStorageKey?.('ops') || '') &&
       submitAdapter === (global.ComposeRuntime?.value?.() || 'pi') &&
       submitExecution === global.ComposeExecution?.revision?.() && global.ComposeExecution?.value?.() !== 'cloud';
@@ -723,6 +731,15 @@
     if (!currentWorkEntry()) return;
     const attachmentContext = routed.attachmentContext;
     const intent = _intent ? _intent.current(text) : { mode: 'chat' };
+    if (['schedule', 'task'].includes(intent.mode) && global.ComposeModelPicker?.hasManualChoice?.()) {
+      const ready = await global.ComposeModelPicker.ready();
+      if (!currentWorkEntry()) return;
+      if (!ready) { global.petSay?.('请选择可用模型'); return; }
+      if (intent.mode === 'task') {
+        const modelName = global.ComposeModelPicker.value().modelName;
+        submittedBridge.model = () => modelName;
+      }
+    }
     let accepted = true;
     if (intent.mode === 'schedule') {
       /* Schedule creation does not go through ComposeWorkActions.prepareSession
@@ -734,9 +751,7 @@
         adapterId: submitAdapter,
         modelName: scheduleSelection.modelName || '',
         repoId: _workspace.repoId || '',
-        isCurrent: () => submitViewSeq === _composeViewSeq &&
-        submitOwner === (global.SoduWorkAPI?.taskStorageKey?.('ops') || '') && input?.value === scheduleInput &&
-        submitAdapter === (global.ComposeRuntime?.value?.() || 'pi') &&
+        isCurrent: () => currentWorkEntry() && input?.value === scheduleInput &&
         (!_attachments?.files || (() => { const current = _attachments.files();
           return current.length === submittedIdentities.length && current.every((file, index) => fileIdentity(file) === submittedIdentities[index]); })()) });
       if (accepted && _intent) _intent.reset();

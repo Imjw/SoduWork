@@ -31,6 +31,24 @@ def _uuid() -> str:
     return str(uuid.uuid4())
 
 
+class ProxyUsageObservation(Base):
+    """Request-level shadow evidence, deliberately independent of quota and session ledgers."""
+    __tablename__ = "proxy_usage_observation"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    client_id: Mapped[str] = mapped_column(String(36))
+    user_id: Mapped[str] = mapped_column(String(36))
+    agent: Mapped[str] = mapped_column(String(240))
+    provider: Mapped[str] = mapped_column(String(240))
+    model: Mapped[str] = mapped_column(String(240))
+    funding: Mapped[str] = mapped_column(String(24))
+    protocol: Mapped[str] = mapped_column(String(24))
+    outcome: Mapped[str] = mapped_column(String(24))
+    evidence: Mapped[str] = mapped_column(String(24))
+    provider_response_hash: Mapped[str] = mapped_column(String(64))
+    counts: Mapped[dict] = mapped_column(JSON)
+
+
 class TaskRequirementAccess(Base):
     """Source-scoped legacy requirement access; never grants Task execution rights."""
     __tablename__ = "task_requirement_access"
@@ -41,6 +59,14 @@ class TaskRequirementAccess(Base):
     principal_id: Mapped[str] = mapped_column(String(64))
     role: Mapped[str] = mapped_column(String(16))
     __table_args__ = (Index("ix_requirement_access_principal", "principal_kind", "principal_id"),)
+
+
+class ClientPeerIdentity(Base):
+    """Immutable application role and possession key for direct device peers."""
+    __tablename__ = "client_peer_identity"
+    client_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    role: Mapped[str] = mapped_column(String(16))
+    public_key: Mapped[str] = mapped_column(String(256))
 
 
 class Client(Base):

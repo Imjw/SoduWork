@@ -46,6 +46,7 @@ except ImportError:  # direct script entry used by source Runner
 _PROTOCOL = 1
 _MAX_FILE_BYTES = 4 * 1024 * 1024
 _MAX_TERMINALS = 8
+_OUTPUT_LOCK = threading.Lock()
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SECRET_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
 _TASK_OUTPUT_RECOVERY_ENV = "SODUWORK_TASK_OUTPUT_RECOVERY_OWNED"
@@ -66,7 +67,33 @@ def _utf8_stdio() -> None:
 
 
 def _emit(value: dict) -> None:
-    print(json.dumps(value, ensure_ascii=False, separators=(",", ":")), flush=True)
+    with _OUTPUT_LOCK:
+        print(json.dumps(value, ensure_ascii=False, separators=(",", ":")), flush=True)
+
+
+def _emit_usage(usage) -> bool:
+    """Accept a settled receipt only when its token categories reconcile to its total."""
+    if not isinstance(usage, dict):
+        return False
+    inp, out, total = (usage.get(key) for key in ("inputTokens", "outputTokens", "totalTokens"))
+    read, write, thought = (usage.get(key, 0) for key in ("cachedReadTokens", "cachedWriteTokens", "thoughtTokens"))
+    if any(type(n) is not int or not 0 <= n < 2**53 for n in (inp, out, total, read, write, thought)):
+        return False
+    # ACP adapters differ on whether cache and reasoning are subsets. Require
+    # one unambiguous split and preserve the provider's total exactly.
+    inputs = {inp + read + write}
+    if inp >= read + write:
+        inputs.add(inp)
+    outputs = {out + thought}
+    if out >= thought:
+        outputs.add(out)
+    matches = [(i, o) for i in inputs for o in outputs if i + o == total]
+    if total and len(matches) == 1:
+        inp, out = matches[0]
+        _emit({"type": "provider_usage", "usage": {"input": inp, "output": out, "total": total,
+               "cacheRead": read, "cacheWrite": write, "reasoning_tokens": thought, "inputIncludesCache": True}})
+        return True
+    return False
 
 
 def _text(value: Any) -> str:
@@ -214,6 +241,7 @@ class AcpBridge:
         self.next_id = 0
         self.pending: dict[Any, dict] = {}
         self.loading = False
+        self.prompt_active = False
         self.message_id = ""
         self.message_has_native_id = False
         self.message_parts: list[str] = []
@@ -253,6 +281,7 @@ class AcpBridge:
             except OSError as exc:
                 raise BridgeError("OpenCode 受管数据目录无法创建，请检查 Runner 数据目录权限。") from exc
             self.outcome = opencode_turn_outcome.Observer()
+            self.outcome.on_usage = _emit_usage
             agent_env = self.outcome.environment(agent_env)
         try:
             self.proc = subprocess.Popen(
@@ -474,7 +503,19 @@ class AcpBridge:
     def _incoming(self, message: dict) -> None:
         method = str(message.get("method") or "")
         if method == "session/update":
-            self._update((message.get("params") or {}).get("update") or {})
+            params = message.get("params") or {}
+            update = params.get("update") or {}
+            if (self.prompt_active and params.get("sessionId") == self.session_id
+                    and update.get("sessionUpdate") == "agent_message_chunk"):
+                meta = update.get("_meta")
+                if isinstance(meta, dict):
+                    if self.agent_name == "qwen" and "durationMs" in meta:
+                        _emit_usage(meta.get("usage"))
+                    elif self.agent_name in {"kimi", "dsh"} and "soduworkUsage" in meta:
+                        if _emit_usage(meta["soduworkUsage"]) and meta.get("soduworkRootUsage") is True:
+                            self.dsh_root_usage_seen = True
+                        return  # This accounting-only notification has no transcript content.
+            self._update(update)
             return
         if "id" not in message:
             return
@@ -630,14 +671,11 @@ class AcpBridge:
             return
         if kind == "plan":
             self._flush_message()
-            for entry in update.get("entries") or []:
-                if not isinstance(entry, dict):
-                    continue
-                title = str(entry.get("content") or "").strip()
-                if title:
-                    _emit({"type": "tool_use", "part": {
-                        "tool": "Plan", "state": {
-                            "input": {"command": title[:300]}}}})
+            entries = [str(entry.get("content") or "").strip()[:300] for entry in update.get("entries") or []
+                       if isinstance(entry, dict)]
+            text = "\n".join(filter(None, entries))
+            if text:
+                _emit({"type": "plan", "part": {"text": text}})
             return
         if kind == "tool_call":
             self._flush_message()
@@ -658,8 +696,11 @@ class AcpBridge:
             _emit({"type": "tool_use", "part": {"tool": title, "callId": tool_id,
                    "toolKind": str(update.get("kind") or "")[:40],
                    "state": {"input": args}}})
-            return
-        if kind == "tool_call_update":
+            # Codex ACP's image reporter emits its terminal status on the initial
+            # notification and never sends a second update for this call.
+            if self.agent_name not in ("codex", "codex-harness"):
+                return
+        if kind in ("tool_call", "tool_call_update"):
             text = _text(update.get("content"))
             if update.get("status") in ("completed", "failed"):
                 text = self.codex_tool_output.finish(update, text)
@@ -707,15 +748,25 @@ class AcpBridge:
             "terminal": self.allow_terminal,
         }
 
+    def _prompt(self, content) -> dict:
+        self.prompt_active = True
+        self.dsh_root_usage_seen = False
+        try:
+            result = self.request("session/prompt", {"sessionId": self.session_id, "prompt": content})
+        finally:
+            self.prompt_active = False
+        # OpenCode returns only the last model message. It, Kimi and Qwen
+        # already emit per-step receipts. Codex account mode uses its own model.
+        if self.agent_name not in {"opencode", "kimi", "qwen", "codex"} and not self.dsh_root_usage_seen:
+            _emit_usage(result.get("usage"))
+        return result
+
     def _compact_dsh_history(self) -> bool:
         # The native command creates a durable checkpoint in this same session.
         # DSH reports command failures as message chunks with an end_turn result.
         self.dsh_compact_reply = []
         try:
-            result = self.request("session/prompt", {
-                "sessionId": self.session_id,
-                "prompt": [{"type": "text", "text": "/compact"}],
-            })
+            result = self._prompt([{"type": "text", "text": "/compact"}])
             return (result.get("stopReason") == "end_turn"
                     and "".join(self.dsh_compact_reply).startswith("Compacted "))
         finally:
@@ -779,10 +830,7 @@ class AcpBridge:
         while True:
             if self.outcome:
                 self.outcome.begin(self.session_id)
-            result = self.request("session/prompt", {
-                "sessionId": self.session_id,
-                "prompt": content,
-            })
+            result = self._prompt(content)
             self._flush_message()
             failure = codex_acp_outcome.failure(self.agent_name, result)
             if failure:

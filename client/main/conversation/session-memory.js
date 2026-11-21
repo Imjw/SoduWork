@@ -76,7 +76,23 @@ function write(app, sessionId, data, replace = false) {
 }
 function bind(app, sessionId, identity, selected, recordOwner = false) {
   if (!selected.length && !recordOwner) return;
-  write(app, sessionId, { owner: scope(identity), hub: new URL(identity.hub).origin, ids: ids(selected) });
+  let protectedHistory = false;
+  try { protectedHistory = JSON.parse(fs.readFileSync(location(app, sessionId), 'utf8')).historyProtection === 'account'; }
+  catch (error) { if (error.code !== 'ENOENT') throw Error('会话记忆关联损坏，请重新打开会话'); }
+  write(app, sessionId, { owner: scope(identity), hub: new URL(identity.hub).origin, ids: ids(selected),
+    ...(protectedHistory ? { historyProtection: 'account' } : {}) });
+}
+function protectHistory(app, sessionId, identity, memoryContext) {
+  if (!sessionId || !String(memoryContext?.prompt || '').trim()) return;
+  // A nonempty private prompt is authoritative evidence even when no memory
+  // was explicitly selected. Persist it before publishing or submitting context.
+  binding(app, sessionId, identity);
+  let record;
+  try { record = JSON.parse(fs.readFileSync(location(app, sessionId), 'utf8')); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  if (record?.historyProtection === 'account') return;
+  write(app, sessionId, { ...(record || { owner: scope(identity), hub: new URL(identity.hub).origin,
+    ids: ids(memoryContext.ids || []) }), historyProtection: 'account' }, true);
 }
 
 function stableKey(scopeName, value) {
@@ -422,6 +438,7 @@ function install({ app, ipcMain, dialog, BrowserWindow, identityOf, requestFn = 
   dimensionWrap('context', async (_event, body = {}) => local.context({ cwd: body.cwd || '', scopes: cleanScopes(body.scopes) }));
 
   async function attach(session, auth, memoryContext, warnings = [], options = {}) {
+    protectHistory(app, session.sessionId, auth, memoryContext);
     let owner = '';
     try { owner = scope(auth); } catch (_) { owner = ''; }
     // History IPC checks persisted account ownership before opening an archive.
@@ -457,7 +474,7 @@ function install({ app, ipcMain, dialog, BrowserWindow, identityOf, requestFn = 
     session.ui = session.ui || {};
     session.ui.memories = memoryContext.items;
     clearMemorySubscription(session);
-    const autoScopes = owner ? dimensionSpecs(options, session.sessionId) : [];
+    const autoScopes = owner && !options.deviceChatContext ? dimensionSpecs(options, session.sessionId) : [];
     const scopes = [...(memoryContext.scopes || []), ...autoScopes].filter((item, index, all) => all.findIndex(other => other.scope === item.scope && other.key === item.key) === index);
     session.ui.memoryScopes = scopes;
     session.ui.capabilityWarnings = [...warnings, ...(memoryContext.warning ? [memoryContext.warning] : []), ...(bindingWarning ? [bindingWarning] : [])];
@@ -542,6 +559,7 @@ function install({ app, ipcMain, dialog, BrowserWindow, identityOf, requestFn = 
       try { owner = scope(auth); } catch (_) {}
       const result = await context(app, auth, options, requestFn);
       if (owner) await sameAccount(owner);
+      if (options?.chatId) protectHistory(app, options.chatId, auth, result);
       return result;
     },
     dimensionRequest, dimensionSpecs,
@@ -549,4 +567,4 @@ function install({ app, ipcMain, dialog, BrowserWindow, identityOf, requestFn = 
     attach: (current, auth, memoryContext, warnings, options) => attach(current, auth, memoryContext, warnings, options),
     bind: (sessionId, auth, selected) => bind(app, sessionId, auth, selected) };
 }
-module.exports = { install, context, bind, binding, ids, request, dimensionSpecs, digestSnapshot };
+module.exports = { install, context, bind, binding, protectHistory, ids, request, dimensionSpecs, digestSnapshot };

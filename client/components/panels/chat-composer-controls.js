@@ -119,6 +119,7 @@
           : '只对后续发送的消息生效，不会中断当前轮次');
     }
     function render() {
+      if (options.state().readOnlyHistory) { close(false); return; }
       sessionControls?.render(); runtimePicker?.render();
       const state = options.state(), selection = state.selection || {};
       global.SoduWorkQuotaNotice?.modelChanged?.(selection.model || state.model, state.adapterId || 'pi', el);
@@ -239,7 +240,7 @@
       await loadModels();
     });
     function loadModels(force = false) {
-      if (lifecycle.signal.aborted) return Promise.resolve(false);
+      if (lifecycle.signal.aborted || options.state().readOnlyHistory) return Promise.resolve(false);
       const scope = modelScope();
       if (!force && catalogFlight?.scope === scope && !catalogFlight.done && !catalogFlight.invalidated)
         return catalogFlight.promise;
@@ -308,7 +309,7 @@
             // A successful directory read proves the old choice is absent.
             // Switch through the normal IPC so runtime state and persistence
             // match the displayed replacement; never infer deletion on errors.
-            const target = availableRow || rows[0];
+            const target = availableRow || (latest.devicePreview && rows.find(row => row.name === response.defaultModels?.[adapter])) || rows[0];
             const request = (async () => {
               const result = latest.draftOnly
                 ? await options.draft.selectModel(target.name, target.label)

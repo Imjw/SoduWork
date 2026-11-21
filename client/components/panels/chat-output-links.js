@@ -161,12 +161,13 @@
       },
     };
   }
-  function mentions(text, filesOrIndex, scopeKey = '') {
+  function mentions(text, filesOrIndex, scopeKey = '', strictPaths = false) {
     const tokens = filesOrIndex && filesOrIndex.__linkIndex
       ? filesOrIndex.scope(scopeKey) : tokensFor(filesOrIndex);
     const lower = String(text).replace(/\\/g, '/').toLocaleLowerCase(), hits = [];
     tokens.forEach(({ label, token, file }) => {
       for (let from=0, at; (at=lower.indexOf(token,from))>=0; from=at+token.length) {
+        if (strictPaths && (lower[at - 1] === '/' || lower[at + token.length] === '/')) continue;
         if ((!text[at-1] || !/[A-Za-z0-9_.-]/.test(text[at-1])) &&
             (!text[at+label.length] || !/[A-Za-z0-9_.-]/.test(text[at+label.length])))
           hits.push({start:at,end:at+label.length,text:text.slice(at,at+label.length),file});
@@ -198,7 +199,7 @@
      entry stores the exact nodeValue plus the (ref + files) signature, so any
      text growth or file-set change invalidates it and forces a rescan. */
   const linkScanCache = new WeakMap();
-  function linkify(root, files, filesSig = '') {
+  function linkify(root, files, filesSig = '', strictPaths = false) {
     files = asFiles(files);
     if (!root || !files.length) return 0;
     const doc=root.ownerDocument, filter=doc.defaultView.NodeFilter;
@@ -207,7 +208,8 @@
       if (anchor.closest('.user,.ntool,.nthink,pre')) return;
       const href = anchor.getAttribute('data-output-href') || anchor.getAttribute('href') || '';
       if (explicitWeb(href)) return;
-      const file = fileTarget(href || anchor.textContent, scoped(anchor,files));
+      const file = strictPaths ? workspaceFileTarget(href || anchor.textContent, scoped(anchor,files)) :
+        fileTarget(href || anchor.textContent, scoped(anchor,files));
       if (!file) return;
       anchor.replaceWith(button(doc,file,anchor.textContent)); count++;
     });
@@ -222,14 +224,14 @@
       const text=node.nodeValue;
       let hits;
       if (LEGACY || !index) {
-        hits = mentions(text, scoped(node.parentElement, files));
+        hits = mentions(text, scoped(node.parentElement, files), '', strictPaths);
       } else {
         const cached = linkScanCache.get(node);
         if (cached && cached.sig === filesSig && cached.text === text) return;
         const parent = node.parentElement;
         const owner = parent && parent.closest ? parent.closest('[data-output-task]') : null;
         const scopeKey = owner && owner.dataset && owner.dataset.outputTask ? String(owner.dataset.outputTask) : '';
-        hits = mentions(text, index, scopeKey);
+        hits = mentions(text, index, scopeKey, strictPaths);
         if (!hits.length) {
           if (filesSig) linkScanCache.set(node, { sig: filesSig, text });
           return;
@@ -284,13 +286,15 @@
     // This also avoids reparsing/linkifying growing text on provider tokens.
     const settled = !global.ChatDeliveries || global.ChatDeliveries.isSettled(snapshot);
     if (!settled) return html; // streaming carry moved to post-patch (chat-decorate-carry)
-    const carrySig = carryFingerprint(previousRoot);
+    // A passive history refresh must honor the newly verified file list.
+    const carrySig = snapshot.localReplica ? '' : carryFingerprint(previousRoot);
     const filesSig = JSON.stringify(files);
     const stateSig = JSON.stringify([decorateStateSignature(snapshot), global.LibraryTransfer?.revision?.() || 0]);
     if (!LEGACY && decorateMemo && decorateMemo.ref === String(ref || '') && decorateMemo.html === html &&
         decorateMemo.filesSig === filesSig && decorateMemo.stateSig === stateSig && decorateMemo.carrySig === carrySig)
       return decorateMemo.decorated;
-    if (!files.length && !snapshot?.artifactUrl && !snapshot?.cloudHandoff?.artifactUrl && !snapshot?.execution?.artifactUrl && !carrySig) return html;
+    const historyMedia = snapshot.localReplica === true && html.includes('<pre>');
+    if (!files.length && !historyMedia && !snapshot?.artifactUrl && !snapshot?.cloudHandoff?.artifactUrl && !snapshot?.execution?.artifactUrl && !carrySig) return html;
     const root = document.createElement('div'); root.innerHTML = html;
     if (carrySig) {
       const messageKey = node => node.dataset.messageOwner != null
@@ -311,8 +315,10 @@
     // A cloud run may return a reachable URL (preview/deployment/PR) without
     // attachments. Still run the delivery decorator so that URL-only output
     // is visible and clickable in the conversation.
+    if (files.length) linkify(root,files,(ref || '') + '\u0000' + filesSig,snapshot.localReplica === true);
+    if (files.length || historyMedia) inlineImages(root,files,ref,snapshot.localReplica === true);
     if (files.length) {
-      linkify(root,files,(ref || '') + '\u0000' + filesSig);inlineImages(root,files,ref);inlineVideos(root,files,ref);
+      inlineVideos(root,files,ref);
       pluginDrafts(root,files,ref,snapshot);
     }
     // The unified decorator owns both local and cloud file cards. A second
@@ -321,7 +327,7 @@
       global.ChatDeliveries.decorate(root, files, ref, snapshot);
       // Ordinary task attachments still use the existing library action;
       // they are not cloud conversation deliveries or local output fallbacks.
-      if (!snapshot.cloudHandoff?.taskId) global.LibraryTransfer?.decorateOutputs(root, files.filter(file => file.taskId), ref, snapshot);
+      if (!snapshot.localReplica && !snapshot.cloudHandoff?.taskId) global.LibraryTransfer?.decorateOutputs(root, files.filter(file => file.taskId), ref, snapshot);
     }
     else global.LibraryTransfer?.decorateOutputs(root,files,ref,snapshot);
     // Media belongs to its review result, including carried nodes from earlier renders.
@@ -330,8 +336,9 @@
       const card = message.querySelector('.nacceptance-result');
       const body = card?.querySelector('.nacceptance-result-body');
       if (!body) return;
-      const media = [...message.querySelectorAll('.noutput-image,.noutput-video,.noutput-library')]
-        .filter(node => node.closest('.nmsg.ai,[data-task-stream]') === message && !node.closest('.nacceptance-result'));
+      const media = [...message.querySelectorAll('.noutput-gallery,.noutput-image,.noutput-video,.noutput-library')]
+        .filter(node => node.closest('.nmsg.ai,[data-task-stream]') === message && !node.closest('.nacceptance-result') &&
+          !node.parentElement.closest('.noutput-gallery'));
       if (!media.length) return;
       let evidence = body.querySelector('[data-acceptance-evidence]');
       if (!evidence) {
@@ -466,25 +473,28 @@
     caption.append(name,hint); card.append(caption);
     return card;
   }
-  function localImageDeclaration(code, files) {
+  function localImageDeclaration(code) {
     if (code.className && !code.classList.contains('language-soduwork-media') &&
         !code.classList.contains('language-json')) return null;
     const source = code.textContent.trim();
-    if (!source.startsWith('{') || source.length > 4096) return null;
+    if (!source.startsWith('{') || source.length > 16384) return null;
     let value;
     try { value = JSON.parse(source); } catch (_) { return null; }
-    if (value?.type !== 'image' || Object.keys(value).some(name => !['type', 'items'].includes(name)) ||
-        !Array.isArray(value.items) || value.items.length !== 1) return null;
-    const item = value.items[0], url = item?.url;
-    if (typeof url !== 'string' || !url || /[:\\?#]/.test(url) ||
-        Object.keys(item).some(name => !['url', 'title'].includes(name))) return null;
-    const relative = url.replace(/^\.\//, '');
-    if (relative.split('/').some(part => !part || part === '.' || part === '..')) return null;
-    const matches = files.filter(file => file.artifactId && !file.deleted && isImage(file) &&
-      file.relative === relative);
-    return matches.length === 1 ? matches[0] : null;
+    if (!['image', 'gallery'].includes(value?.type) || Object.keys(value).some(name => !['type', 'items'].includes(name)) ||
+        !Array.isArray(value.items) || !value.items.length || value.items.length > 100 ||
+        (value.type === 'image' && value.items.length !== 1)) return null;
+    const paths = [];
+    for (const item of value.items) {
+      const url = item?.url;
+      if (typeof url !== 'string' || !url || /[:\\?#\u0000-\u001f]/.test(url) ||
+          Object.keys(item).some(name => !['url', 'title'].includes(name))) return null;
+      const relative = url.replace(/^\.\//, '');
+      if (relative.split('/').some(part => !part || part === '.' || part === '..')) return null;
+      paths.push(relative);
+    }
+    return { type: value.type, paths };
   }
-  function inlineImages(root, files, ref) {
+  function inlineImages(root, files, ref, historyMedia) {
     files = asFiles(files);
     const doc = root.ownerDocument, shown = new Set([...root.querySelectorAll('[data-output-image],[data-delivery-preview]')]
       .map(node => node.dataset.outputImage || node.dataset.deliveryPreview));
@@ -502,17 +512,38 @@
       if (message.dataset.deliveryFinal !== 'false') owners.set(task, message);
       const target = owners.get(task);
       const candidates = new Map(), available = scoped(message,files);
-      if (target === message) {
+      if (target === message || historyMedia) {
         message.querySelectorAll('.nmd pre > code').forEach(code => {
-          const file = localImageDeclaration(code, available);
-          if (!file) return;
-          const preview = shown.has(key(file)) ? button(doc, file, file.name) : imageCard(doc, file, ref);
-          shown.add(key(file));
-          code.parentElement.replaceWith(preview);
+          const declaration = localImageDeclaration(code);
+          if (!declaration) return;
+          // A basename is not proof that a screenshot belongs to this gallery.
+          const entries = declaration.paths.map(relative => {
+            const matches = available.filter(file => file.artifactId && !file.deleted && isImage(file) && file.relative === relative);
+            return matches.length === 1 ? matches[0] : null;
+          });
+          if (!historyMedia && entries.every(file => !file)) return;
+          const group = doc.createElement('div');
+          group.className = 'noutput-gallery nmedia-group';
+          if (declaration.type === 'gallery' && entries.length > 1) group.classList.add('nmedia-grid');
+          group.dataset.chatMedia = JSON.stringify([ref, global.SoduWorkAPI?.taskStorageKey?.('ops'), declaration.paths,
+            entries.map(file => file && [key(file), file.at, file.size])]);
+          entries.forEach((file, i) => {
+            if (file) {
+              const preview = declaration.type === 'image' && shown.has(key(file)) ? button(doc, file, file.name) : imageCard(doc, file, ref);
+              shown.add(key(file));
+              group.append(preview);
+            } else {
+              const missing = doc.createElement('span');
+              missing.className = 'noutput-image-missing'; missing.setAttribute('role', 'status');
+              missing.textContent = (global.SoduWorkI18n?.translateText?.('图片暂时无法预览') || '图片暂时无法预览') + ' · ' + declaration.paths[i];
+              group.append(missing);
+            }
+          });
+          code.parentElement.replaceWith(group);
         });
       }
       message.querySelectorAll('[data-output-image-ref]').forEach(node => {
-        const file = fileTarget(node.dataset.outputImageRef,available);
+        const file = historyMedia ? workspaceFileTarget(node.dataset.outputImageRef,available) : fileTarget(node.dataset.outputImageRef,available);
         if (file && !file.deleted && isImage(file)) {
           candidates.set(key(file),file);
           if (file.processEvidence || !target) node.replaceWith(button(doc,file,node.textContent || file.name));

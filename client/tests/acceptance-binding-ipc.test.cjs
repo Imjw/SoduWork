@@ -31,6 +31,7 @@ function fixture(t) {
       return { accepted: true, completion: Promise.resolve({ ok: true }) };
     } };
   const modules = {
+    '../conversation/device-local-continuation.cjs': require('../main/conversation/device-local-continuation.cjs'),
     '../requirement-diagnostics.cjs': require('../main/requirement-diagnostics.cjs'),
     '../device-auth-request': require('../main/device-auth-request'),
     './skill-turn': require('../main/pi-session/skill-turn'),

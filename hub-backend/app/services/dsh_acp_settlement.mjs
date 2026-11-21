@@ -41,6 +41,32 @@ export async function waitForSettlement(agent, subagents, signal) {
 
 const START = '        const stopReason = await new Promise(';
 const END = '        const usage = record.projection.promptUsage();';
+// Follow settled native requests, including children owned by this prompt.
+// Session/load replays a projection and does not enter this live event hook.
+function liveUsageSource(source) {
+  const link = '      subagentByChild.set(childSessionId, link);';
+  const event = '  ctx.on("session/event", (session, event) => {\n    const sessionId = String(session.header.id);';
+  if (source.split(link).length !== 2 || source.split(event).length !== 2) return source;
+  return source.replace(link, `      link.usageOwner = parentLink ? parentLink.usageOwner : record.inflight;
+${link}`).replace(event, event + `
+    if (event.type === 'assistant/message') {
+      const child = subagentByChild.get(sessionId);
+      const rootId = child?.rootSessionId ?? sessionId;
+      const root = sessions.get(rootId);
+      const owner = child ?? root;
+      const usage = event.data?.usage;
+      const model = event.data?.message?.source?.model;
+      if (owner?.agent?.session === session && root?.inflight && (!child || root.inflight === child.usageOwner) &&
+          model === process.env.DSH_MODEL && usage && Number.isSafeInteger(event.seq) &&
+          event.seq > (owner.lastUsageSeq ?? -1)) {
+        owner.lastUsageSeq = event.seq;
+        notify(rootId, {sessionUpdate: 'agent_message_chunk', content: {type:'text', text:''},
+          _meta: {soduworkRootUsage: !child, soduworkUsage: {inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
+            totalTokens: usage.totalTokens, cachedReadTokens: usage.cacheReadTokens ?? 0,
+            cachedWriteTokens: usage.cacheWriteTokens ?? 0, thoughtTokens: usage.reasoningTokens ?? 0}}});
+      }
+    }`);
+}
 // Hash the complete upstream prompt settlement block, not a loose substring.
 // A changed adapter must be reviewed before this compatibility fix is applied.
 const SETTLEMENT_HASHES = new Map([
@@ -134,7 +160,7 @@ export function transformBridgeSource(source, version) {
     DISCARD_PREVIEWS + '    this.toolCallBlocks.clear();').replace('    return [];', '    return updates;');
   return 'import { waitForSettlement as __soduworkWaitForSettlement } from '
     + JSON.stringify(import.meta.url) + ';\n'
-    + source.replace(source.slice(start, end), REPLACEMENT).replace(turnBlock, fixedTurn);
+    + liveUsageSource(source.replace(source.slice(start, end), REPLACEMENT).replace(turnBlock, fixedTurn));
 }
 
 if (process.env.SODUWORK_DSH_ACP_SETTLEMENT === '1') {

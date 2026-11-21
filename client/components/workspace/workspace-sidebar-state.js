@@ -204,7 +204,17 @@
     if (Array.isArray(row.usedHarnesses)) out.usedHarnesses = unique(row.usedHarnesses);
     if (typeof row.workOnly === 'boolean') out.workOnly = row.workOnly;
     if (typeof row.draftAdapterId === 'string') out.draftAdapterId = row.draftAdapterId.slice(0, 160);
+    if (typeof row.cloud === 'boolean') out.cloud = row.cloud;
+    if (typeof row.cached === 'boolean') out.cached = row.cached;
     return out;
+  }
+  function visibleSavedRow(row) {
+    if (row.adapterId !== 'account-sync' && !/^(?:acct-|account:)/.test(row.id)) return true;
+    // Retired account snapshots are not history authority, including before
+    // async local discovery completes. Keep their bytes for recovery; only a
+    // currently authorized native/import record may make them visible again.
+    const id = localHistory?.aliases.get(row.id), record = localHistory?.records.get(id);
+    return Boolean(record && !record.archived && !record.deleted);
   }
   function sourceOwner(key) {
     if (key.startsWith(accountPrefix)) {
@@ -440,7 +450,7 @@
       const byId = new Map(rows.map(row => [String(row.id), row]));
       const tasks = new Map();
       for (const row of byId.values()) {
-        if (!String(row.id).startsWith('cloud-sync-')) continue;
+        if (row.cloud !== true && !String(row.id).startsWith('cloud-sync-')) continue;
         for (const task of unique([row.taskId, ...(Array.isArray(row.taskIds) ? row.taskIds : [])])) {
           const candidates = tasks.get(task) || new Set();
           candidates.add(row); tasks.set(task, candidates);
@@ -551,7 +561,8 @@
       items = (items || []).filter(Boolean);
       sourceRows = items;
       const current = new Map((items || []).filter(row => row?.id).map(row => [String(row.id), row]));
-      let rows = [...(items || []).filter(Boolean), ...state.rows.filter(row => !current.has(row.id))];
+      let rows = [...(items || []).filter(Boolean), ...state.rows.filter(row =>
+        !current.has(row.id) && visibleSavedRow(row))];
       visibleRows = rows;
       const byId = referenceMap(rows);
       rows = [...new Map(rows.map(row => byId.get(String(row.id))).filter(Boolean).map(row => [row.id, row])).values()];
@@ -595,6 +606,17 @@
       },
       view, get: () => { refresh(); return copy(state); },
       getAccount: () => { refresh(); return copy(device.accountState(accountState)); },
+      cloudProjectMembers(ids, confirmed = []) {
+        refresh();
+        const known = new Map([...state.rows, ...visibleRows].map(row => [row.id, row]));
+        const accepted = new Set(confirmed);
+        return unique(ids.map(id => {
+          if (accepted.has(id)) return id;
+          const row = known.get(id);
+          if (row?.cloud !== true || row.cached || !row.taskId) return '';
+          return 'cloud-task:' + row.taskId;
+        }));
+      },
       remember: items => { if (writable || device.enabled()) commit(next => remember(next, items)); },
       recordAppChat(appId, name, row, appIcon) {
         appId = String(appId || '').trim();
@@ -752,7 +774,16 @@
   function projectSync({store, api, storage, key, current = () => true, changed = () => {}, error = () => {}}) {
     const checkpointKey = key + ':sync';
     let busy = false, pending = false, applying = false;
-    const shape = row => row ? {name: row.name, chatIds: row.chatIds, deleted: false} : null;
+    let confirmed = [];
+    // Only the authenticated cloud directory or a runtime cloud projection can
+    // establish a transferable member. Native IDs and group names stay local.
+    const members = ids => store.cloudProjectMembers?.(unique(ids), confirmed) || [];
+    const remoteShape = row => row && !row.deleted ? { ...row,
+      chatIds: unique(row.chatIds).filter(id => /^cloud-task:[^\s]+$/.test(id)) } : null;
+    const shape = row => {
+      const chatIds = row && !row.deleted ? members(row.chatIds) : [];
+      return chatIds.length ? {name: row.name, chatIds, deleted: false} : null;
+    };
     const digest = row => JSON.stringify(shape(row));
     async function run() {
       if (applying || !current() || !api.conversationProjects) return;
@@ -765,6 +796,9 @@
         const reply = await api.conversationProjects();
         if (!current()) return;
         const remote = new Map(reply.items.map(row => [row.id, row]));
+        confirmed = unique([...reply.items.flatMap(row => remoteShape(row)?.chatIds || []),
+          ...Object.values(checkpoints).filter(value => value.version === 2)
+            .flatMap(value => JSON.parse(value.hash)?.chatIds || [])]);
         const getAccount = () => store.getAccount ? store.getAccount() : store.get();
         const local = new Map(getAccount().projects.filter(row => !row.appId).map(row => [row.id, row]));
         for (const id of new Set([...local.keys(), ...remote.keys(), ...Object.keys(checkpoints)])) {
@@ -773,21 +807,29 @@
           const here = getAccount().projects.find(row => row.id === id && !row.appId);
           const there = remote.get(id), saved = checkpoints[id];
           const hash = digest(here);
-          const dirty = saved ? hash !== saved.hash : !!here && !there;
+          // Older checkpoints include native membership. Compare their cloud
+          // projection without erasing the recoverable local layout.
+          const savedHash = saved && saved.version !== 2 ? digest(JSON.parse(saved.hash)) : saved?.hash;
+          const dirty = saved ? hash !== savedHash : !!shape(here) && !there;
           if (dirty) {
-            const body = here ? shape(here) : {name: saved.name, deleted: true};
+            const body = shape(here) || {name: saved.name, chatIds: [], deleted: true};
             const updated = await api.saveConversationProject(id, {...body, revision: saved?.revision || 0});
             if (!current()) return;
             // Re-read: edits made while the request was in flight remain dirty.
-            checkpoints[id] = {revision: updated.revision, hash, name: updated.name};
+            checkpoints[id] = {version: 2, revision: updated.revision, hash, name: updated.name || body.name};
           } else if (there) {
-            if (!saved && here && digest(here) !== digest(there)) {
+            const projected = remoteShape(there);
+            if (!saved && shape(here) && digest(here) !== digest(projected)) {
               throw Error('项目在另一台设备也有改动，原分组已保留，请在项目中确认后重试');
             }
+            const localIds = (here?.chatIds || []).filter(id => !members([id]).length);
+            const chatIds = unique([...localIds, ...(projected?.chatIds || [])]);
+            const retained = !projected?.chatIds.length && here && (!shape(here) || localIds.length);
             applying = true;
-            try { store.applyRemoteProject({...there, chatIds: shape(there).chatIds}); }
+            try { store.applyRemoteProject({...there, ...(retained ? {name: here.name} : {}),
+              chatIds, deleted: !projected?.chatIds.length && !retained}); }
             finally { applying = false; }
-            checkpoints[id] = {revision: there.revision, hash: digest(there.deleted ? null : there), name: there.name};
+            checkpoints[id] = {version: 2, revision: there.revision, hash: digest(projected), name: there.name};
             changed();
           }
           storage.setItem(checkpointKey, JSON.stringify(checkpoints));

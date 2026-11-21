@@ -930,11 +930,38 @@ def runner_info_sync(cfg: dict, ref: str) -> dict:
 
 
 
+def _absent_archive(ref: str) -> bool:
+    """A missing journal alone cannot prove that a partial archive is gone."""
+    import stat
+    folder = os.path.join(_STORE, ref)
+    try:
+        if not stat.S_ISDIR(os.lstat(_STORE).st_mode):
+            return False
+        try:
+            if not stat.S_ISDIR(os.lstat(folder).st_mode):
+                return False
+        except FileNotFoundError:
+            return True
+        with os.scandir(folder) as entries:
+            return next(entries, None) is None
+    except FileNotFoundError:
+        # A freshly installed data root can predate the local-runs directory.
+        return os.path.isdir(os.path.dirname(_STORE)) and not os.path.lexists(_STORE)
+    except OSError:
+        return False
+
+
 def session_sync(cfg: dict, ref: str, since: int = 0, limit: int = 400) -> dict:
     """Return incremental console activity plus current context occupancy, segment count, and
     state. Use memory when available and archives for older or restarted sessions.
     """
-    from . import local_task_goal
+    from . import local_task_goal, runner_event_scope
+    device_transfer = {"schemaVersion": 1, "quiescent": False}
+    strict = (cfg or {}).get("historyRead") is True
+    unavailable = {"ok": False, "ref": ref, "items": [], "code": "NATIVE_HISTORY_UNAVAILABLE",
+                   "error": "本机原生历史暂时无法读取", "deviceTransfer": device_transfer}
+    if strict and (not ref or ref in {".", ".."} or os.path.basename(ref) != ref or "\x00" in ref):
+        return unavailable
     with _LOCK:
         run = _RUNS.get(ref)
     # A client can reconnect before the startup reclaim pass reaches this ref.
@@ -942,10 +969,23 @@ def session_sync(cfg: dict, ref: str, since: int = 0, limit: int = 400) -> dict:
     # are available immediately after a Hub restart.
     if not run:
         meta_path = os.path.join(_STORE, ref, "meta.json")
-        if os.path.isfile(meta_path):
+        has_meta = os.path.isfile(meta_path)
+        if strict:
+            import stat
+            try:
+                has_meta = stat.S_ISREG(os.lstat(meta_path).st_mode)
+                if not has_meta:
+                    return unavailable
+            except FileNotFoundError:
+                has_meta = False
+            except OSError:
+                return unavailable
+        if has_meta:
             reclaim()
             with _LOCK:
                 run = _RUNS.get(ref)
+            if strict and not run:
+                return unavailable
     with _LOCK:
         if run:
             mem = list(run.get("lines") or [])
@@ -968,17 +1008,46 @@ def session_sync(cfg: dict, ref: str, since: int = 0, limit: int = 400) -> dict:
             metadata_private = runner_usage_receipts.private_model(run)
             event_destination = ({"eventDestination": run["eventDestination"]}
                                  if "eventDestination" in run else {})
+            # A terminal label alone does not prove native cleanup has finished.
+            # An idle Hub job also remains Hub-owned, including after restart.
+            # Capture this receipt under the same lock as the authoritative run.
+            goal = run.get("goalState")
+            goal_finished = (run.get("goalContract") is None or
+                             isinstance(goal, dict) and goal.get("status") in {"completed", "disabled"})
+            device_transfer["quiescent"] = bool(
+                state in {"done", "failed", "stopped", "interrupted"}
+                and runner_event_scope.is_local(run, ref)
+                and run.get("proc") is None and goal_finished
+                and not (isinstance(goal, dict) and goal.get("pending"))
+                and not any(run.get(key) for key in (
+                    "stopping", "detached", "_launchPending", "_hostCleanup", "queue",
+                    "goalUserPending", "contextCompacting", "_accessTransition",
+                    "pendingPermissions", "permissionWaiting")))
     if not run:
-        items = _read_events(ref, since, limit)
+        try:
+            items = _read_events(ref, since, limit, strict=strict)
+        except FileNotFoundError:
+            if since == 0 and _absent_archive(ref):
+                with _LOCK:
+                    if ref not in _RUNS:
+                        return {**unavailable, "code": "NATIVE_HISTORY_MISSING", "error": "本机原生历史已不存在"}
+            return unavailable
+        except (OSError, ValueError):
+            return unavailable
         if not items and since == 0:
-            return {"ok": False, "items": [], "error": "本地会话不在了"}
+            if strict:
+                return unavailable
+            return {"ok": False, "items": [], "error": "本地会话不在了", "deviceTransfer": device_transfer}
         return {"ok": True, "items": items, "status": "unknown",
-                "last": items[-1]["seq"] if items else since}
+                "last": items[-1]["seq"] if items else since, "deviceTransfer": device_transfer}
     first = mem[0]["seq"] if mem else 0
     if mem and since >= first - 1:
         items = [x for x in mem if x["seq"] > since][:limit]
     else:
-        items = _read_events(ref, since, limit)      # Read the archive when the requested history predates the memory buffer.
+        try:
+            items = _read_events(ref, since, limit, strict=strict and seq > 0)
+        except (OSError, ValueError):
+            return unavailable
     return {"ok": True, "ref": ref, "taskId": task_id, "items": items, "status": access_policy.visible_state(run) if run else state,
             **(access_policy.snapshot(run) if run else {}),
             "last": items[-1]["seq"] if items else since,
@@ -987,6 +1056,7 @@ def session_sync(cfg: dict, ref: str, since: int = 0, limit: int = 400) -> dict:
             "tokens": tokens, "ctxPct": round(pct, 1), "ctxWindow": win,
             "ctxWindowKnown": known, "error": err, "workDir": ws,
             "failureKind": failure_kind, "failurePath": failure_path,
+            "deviceTransfer": device_transfer,
             **({"taskGoal": local_task_goal.snapshot(run)} if run.get("goalContract") and cli != "pi" else {}),
             "cli": cli, "cliName": cli_name, "cliSid": cli_sid, "model": model,
             runner_usage_receipts.PRIVACY_MARKER: metadata_private,

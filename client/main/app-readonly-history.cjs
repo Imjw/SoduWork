@@ -88,16 +88,17 @@ function create({app,session=require('./agent-runtime/pi-session-bridge'),access
   // The durable catalog supplies immutable creator provenance; the current
   // native index supplies any ownership written into the actual transcript.
   // Neither can override a conflicting owner from the other.
-  readable(app,p.id,captured,{...row,...(found.entry.workOwner?{workOwner:found.entry.workOwner}:{})});
+  const {mergeNativeEvidence}=require('./conversation/history-evidence.cjs');
+  readable(app,p.id,captured,mergeNativeEvidence(row,found.entry));
   const base=path.join(app.getPath('userData'),'pi-agent'),file=found.entry.path;
   const real=await plainArchivePath(base,file);guard();
   const stat=await fs.promises.stat(real);if(!stat.isFile()||stat.size>128*1024*1024)throw Error('会话存档过大或不是普通文件');
   const page=await readNativePage(real,p,guard);
   const latest=await session.historyEntry(app,selected.id);guard();
   if(!latest?.ok||latest.entry?.path!==file)throw Error('会话存档已变化，请重新打开');
-  readable(app,p.id,captured,{...row,...(latest.entry.workOwner?{workOwner:latest.entry.workOwner}:{})});
+  readable(app,p.id,captured,mergeNativeEvidence(row,latest.entry));
   return {ok:true,format:'messages',...page,segments};
  };
 }
 async function handle(app,method,params,guard){return create({app})(method,params,guard);}
-module.exports={create,handle};
+module.exports={create,handle,plainArchivePath};

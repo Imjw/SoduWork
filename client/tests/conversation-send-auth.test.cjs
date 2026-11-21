@@ -289,6 +289,30 @@ test('production installed cached readonly snapshots load the original transcrip
   assert.equal((await snapshot()).ok, true, 'renewing the same account preserves passive snapshot access');
 });
 
+test('a second account can page its desktop preview without granting embedded windows or transfer access', async t => {
+  const f = await fixture(t, catalog.runtime('pi')), id = 'desktop-preview-owner-a';
+  const history = f.installed.deviceHistory, owner = await f.identity();
+  const [row] = await history.register([{ id, adapterId: 'pi', count: 220, workOwner: scope(owner),
+    creator: { account: 'fixture-account-a', hub: owner.hub } }]);
+  const messages = Array.from({ length: 220 }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', text: 'Line ' + i }));
+  assert.equal((await history.store.saveDeviceHistory(id, { snapshot: { messages, tools: [] },
+    coverage: { complete: true } }, { expectedRevision: row.replicaRevision })).ok, true);
+  assert.equal((await f.login()).ok, true);
+  const opened = await f.openInstalled({ chatId: id, historyIntent: 'view' });
+  assert.equal(opened.ok, true, opened.reason);
+  assert.equal(opened.snapshot.execution.canContinueOnDevice, true);
+  assert.equal(opened.snapshot.messages.length, 100);
+  const snapshot = event => f.handlers.get('pi-session-snapshot')(event, opened.ref, { messageLimit: 220 });
+  const page = await snapshot(f.event);
+  assert.equal(page.ok, true);
+  assert.equal(page.snapshot.messages.length, 220);
+  assert.equal(page.snapshot.messages[0].text, 'Line 0');
+  await assert.rejects(Promise.resolve().then(() => snapshot({ ...f.event, senderFrame: {} })), /账号|归属/);
+  await assert.rejects(history.exportPortable(id), /账号|归属/);
+  assert.equal(f.frames.some(frame => frame.channel === 'pi-session-event' && frame.data.ref === opened.ref), false);
+  assert.deepEqual(f.turns, []);
+});
+
 test('an expired cached readonly view cannot publish a transcript before credentials are renewed', async t => {
   const f = await fixture(t, catalog.runtime('pi')), handle = await openCachedCopy(f);
   f.expire();

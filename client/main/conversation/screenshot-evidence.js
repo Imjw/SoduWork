@@ -43,7 +43,7 @@ function collect(cwd, options = {}) {
     dir = fs.opendirSync(folder);
   } catch (_) { return []; }
   const since = Math.max(0, Number(options.since) || 0), turnSince = Math.max(0, Number(options.turnSince) || 0);
-  const latest = Date.now() + 1000, images = [];
+  const latest = Math.min(Date.now() + 1000, Number(options.until) || Infinity), images = [];
   try {
     for (let visited = 0; visited < MAX_ENTRIES; visited++) {
       const entry = dir.readSync();
@@ -61,6 +61,7 @@ function collect(cwd, options = {}) {
         fd = fs.openSync(target, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
         const current = fs.fstatSync(fd), at = Math.round(current.mtimeMs);
         if (!current.isFile() || current.ino !== stat.ino || current.dev !== stat.dev ||
+            options.until && (current.nlink !== 1 || current.ctimeMs < since || current.ctimeMs > latest) ||
             current.size <= 0 || current.size > MAX_BYTES || at < since || at > latest) continue;
         const bytes = Buffer.alloc(32), length = fs.readSync(fd, bytes, 0, bytes.length, 0);
         if (!raster(bytes.subarray(0, length), extension)) continue;

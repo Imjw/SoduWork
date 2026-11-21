@@ -68,7 +68,7 @@ test('production IPC requires confirmation before deleting local bytes', async t
   assert.equal((await f.remove({ confirmed: true })).ok, true); assert.equal(f.recycled(), 1);
 });
 
-test('account original lifecycle bypasses downloaded read locators while explicit local identities stay offline', async t => {
+test('legacy account lifecycle bypasses explicit import locators while local identities stay offline', async t => {
   const f = await fixture(t), actor = require('./helpers/platform-session-fixture.cjs').identity();
   const auth = require('../main/device-auth'), prior = Object.fromEntries(['identity', 'session', 'profiles', 'localOwner'].map(key => [key, auth[key]]));
   let current = actor;
@@ -78,8 +78,10 @@ test('account original lifecycle bypasses downloaded read locators while explici
   const original = { id: 'acct-original', sourceSessionId: 'foreign-native', sourceClientId: 'other-device',
     accountProjection: true, accountConversation: true, adapterId: 'account-sync',
     owner: require('../main/platform-connections/runtime.cjs').connectionScope(actor) };
-  await f.history().capture({ historyRow: () => original,
-    snapshot: () => ({ messages: [{ role: 'assistant', text: 'Synthetic downloaded copy' }] }) }, actor);
+  const [imported] = await f.history().register([{ id: 'explicit-import', cached: true, importedHistory: true,
+    source: { id: original.id, hub: actor.hub, account: 'one' }, sourceSessionId: original.sourceSessionId }]);
+  await f.history().store.cache(imported.id, [{ role: 'assistant', text: 'Synthetic downloaded copy' }],
+    { expectedRevision: imported.replicaRevision, complete: true });
   const copy = (await f.history().list()).items.find(row => row.cached);
   await f.history().register([{ ...copy, historyAliasIds: ['native-copy-alias'] }]);
   const handlers = new Map(), writes = [];

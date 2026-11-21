@@ -134,13 +134,40 @@ async function checkCatalogUsage({ win, js, waitFor, sleep, screenshot, changeLo
     await resetScroll(); await screenshot('model-dimensions-no-queue')
 
     for (const locale of ['zh-CN', 'en-US', 'ja-JP', 'ko-KR']) {
-      await navigate('usage', 'document.querySelectorAll(".ugc-member-table tbody tr").length === 1 && !!document.querySelector(".ugc-plot svg")', 'populated usage fixture')
+      await navigate('usage', '!!document.querySelector("#ugc-tab-members") && !!document.querySelector(".ugc-plot svg")', 'populated usage fixture')
+      await js("document.querySelector('#ugc-tab-members').click()")
       await changeLocale(locale)
+      const usageCopy = {
+        'zh-CN': ['用量明细', '底座与模型', '底座', '模型', '搜索成员', '搜索底座或模型', '没有匹配的结果', '试试其他关键词', '每页条数', '每页 10 条', '模型组合'],
+        'en-US': ['Usage details', 'Agents and models', 'Agent', 'Model', 'Search members', 'Search agents or models', 'No matching results', 'Try a different search term', 'Rows per page', '10 per page', 'Model combinations'],
+        'ja-JP': ['使用量の詳細', 'エージェントとモデル', 'エージェント', 'モデル', 'メンバーを検索', 'エージェントまたはモデルを検索', '一致する結果がありません', '別のキーワードをお試しください', '1ページの表示件数', '1ページに10件', 'モデルの組み合わせ'],
+        'ko-KR': ['사용량 상세', '에이전트 및 모델', '에이전트', '모델', '구성원 검색', '에이전트 또는 모델 검색', '일치하는 결과가 없습니다', '다른 검색어를 입력하세요', '페이지당 행 수', '페이지당 10개', '모델 조합'],
+      }[locale]
+      const memberSearch = await js("document.querySelector('.ugc-detail-search input').getAttribute('aria-label')")
+      record('usage member search uses selected language ' + locale, memberSearch === usageCopy[4], memberSearch)
+      await js("document.querySelector('#ugc-tab-agents').click()")
+      const detailCopy = await js(`(() => {
+        const panel = document.querySelector('.ugc-details');
+        return [panel.querySelector('h3').textContent, document.querySelector('#ugc-tab-agents').firstChild.textContent,
+          ...[...panel.querySelectorAll('th')].slice(0, 2).map(e => e.textContent),
+          panel.querySelector('input').getAttribute('aria-label'), panel.querySelector('select').getAttribute('aria-label'),
+          panel.querySelector('option').textContent, panel.querySelector('.ugc-pager').textContent];
+      })()`)
+      record('usage details labels use selected language ' + locale,
+        JSON.stringify(detailCopy.slice(0, 7)) === JSON.stringify([usageCopy[0], usageCopy[1], usageCopy[2], usageCopy[3], usageCopy[5], usageCopy[8], usageCopy[9]]) && detailCopy[7].includes(usageCopy[10]), detailCopy)
+      await js(`(() => { const input = document.querySelector('.ugc-detail-search input');
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, 'no-matching-fixture');
+        input.dispatchEvent(new Event('input', { bubbles: true })); })()`)
+      await waitFor('!!document.querySelector(".ugc-details .ugc-empty")', 'localized empty search')
+      const emptyCopy = await js("document.querySelector('.ugc-details .ugc-empty').textContent")
+      record('usage empty search uses selected language ' + locale,
+        emptyCopy.includes(usageCopy[6]) && emptyCopy.includes(usageCopy[7]), emptyCopy)
+      await js("document.querySelector('#ugc-tab-members').click()")
       const copy = await js('(' + function () {
         return { labels: [...document.querySelectorAll('.ugc-metric-head > span')].map(e => e.textContent),
-          record: document.querySelector('.ugc-metric > p').textContent, share: document.querySelector('.ugc-member-table th:last-child').textContent,
+          record: document.querySelector('.ugc-metric > p').textContent, share: document.querySelector('.ugc-detail-table th:nth-child(4)').textContent,
           unit: document.querySelector('.ugc-metric-value > span').textContent, agent: document.querySelector('.ugc-filterbar > label:last-child > span').textContent,
-          user: document.querySelector('.ugc-member b').textContent,
+          user: document.querySelector('.ugc-detail-link').textContent,
           lang: document.documentElement.lang, translation: document.documentElement.getAttribute('translate'),
           notranslate: document.documentElement.classList.contains('notranslate'), meta: document.querySelector('meta[name="google"]')?.content }
       }.toString() + ')()')

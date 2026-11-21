@@ -10,7 +10,7 @@ const { identity } = require('./helpers/platform-session-fixture.cjs');
 const auth = require('../main/device-auth');
 const { scope } = require('../main/platform-connections/runtime.cjs');
 
-async function fixture(t, { native = true, synced = true, sidecar = true } = {}) {
+async function fixture(t, { native = true, synced = true, sidecar = true, missingRunner = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'conversation-lifecycle-'));
   const app = { getPath: () => root }, actor = identity(), saved = {};
   let current = actor;
@@ -54,7 +54,9 @@ async function fixture(t, { native = true, synced = true, sidecar = true } = {})
     return response(true, { items: [...(item ? [{ ...item }] : []), ...extraItems],
       cursor: Math.max(item?.revision || 0, ...extraItems.map(value => value.revision)), hasMore: false });
   };
-  const bridge = createPiSessionBridge({ app, sessionModule: sessions, runnerAdapters: [] });
+  const bridge = createPiSessionBridge({ app, sessionModule: sessions, runnerAdapters: [],
+    historyAdapters: missingRunner ? [{ id: 'opencode', history: async () => ({ ok: true, chats: [] }),
+      historyEntry: async () => ({ ok: true, chats: [] }) }] : [] });
   const startSync = () => createSync({ app, identityOf: async () => current,
     store: createStore(path.join(root, 'outbox.json')), fetch,
     resolveNativeSource: (item, identity) => nativeSource.resolve({ app, session: bridge, item, identity }) });
@@ -394,7 +396,7 @@ test('missing switched history keeps all source aliases until every account dele
 });
 
 test('ordinary switched deletion preserves aliases for missing-content retry after partial account failure', async t => {
-  const f = await fixture(t);
+  const f = await fixture(t, { missingRunner: true });
   const segments = require('../main/conversation/runtime-segments');
   f.extraItems.push({ ...f.item, id: 'acct-second', sourceSessionId: 'missing-runner' });
   await segments.save(f.app, { version: 1, id: 'native', owner: scope(f.actor),

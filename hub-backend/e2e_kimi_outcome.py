@@ -110,7 +110,8 @@ class Fixture:
                         "content": [],
                         "stop_reason": None,
                         "stop_sequence": None,
-                        "usage": {"input_tokens": 1, "output_tokens": 0},
+                        "usage": {"input_tokens": 1, "output_tokens": 0, "cache_read_input_tokens": 0,
+                                  "cache_creation_input_tokens": 0},
                     }
                 },
             )
@@ -172,6 +173,11 @@ class Fixture:
             else:
                 chunk({"content": "PARTIAL" if limited else "FIXTURE_DONE"})
             chunk({}, "length" if limited else "tool_calls" if tool else "stop")
+            if self.scenario == "normal":
+                packet = {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "created": 1,
+                          "model": "fixture-model", "choices": [], "usage": {
+                              "prompt_tokens": 1, "completion_tokens": 10, "total_tokens": 11}}
+                handler.wfile.write(("data: " + json.dumps(packet) + "\n\n").encode())
             handler.wfile.write(b"data: [DONE]\n\n")
             handler.wfile.flush()
 
@@ -232,6 +238,8 @@ net.Socket.prototype.connect=function(...args){
         for name in ("SYSTEMROOT", "WINDIR", "COMSPEC"):
             if os.environ.get(name):
                 env[name] = os.environ[name]
+        if os.name == "nt" and os.environ.get("KIMI_SHELL_PATH"):
+            env["KIMI_SHELL_PATH"] = os.environ["KIMI_SHELL_PATH"]
         acp_agents.home_env("kimi", env, str(root / "data"))
         acp_agents.inject_llm_env(
             "kimi",
@@ -290,6 +298,10 @@ net.Socket.prototype.connect=function(...args){
             ]
             assert not fixture.failures, str(fixture.failures)
             assert fixture.calls > 0, "Native startup failed: " + stderr[-1000:]
+            if scenario == "normal":
+                assert sum(e["usage"]["total"] for e in events if e.get("type") == "provider_usage") == 11
+            elif provider == "openai":
+                assert not any(e.get("type") == "provider_usage" for e in events), "Missing provider usage"
             assert all(
                 ((root / "work" / name).read_bytes(), (root / "work" / name).stat().st_mtime_ns)
                 == value

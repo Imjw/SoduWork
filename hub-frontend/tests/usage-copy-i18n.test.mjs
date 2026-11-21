@@ -63,11 +63,12 @@ test('the rendered Chinese usage copy uses 用量 consistently for records, tool
   const metric = pulse.nodes(node => node.type?.name === 'Metric')[0]
   assert.equal(metric.props.note, '近 90 天 · 6,819 条用量记录')
   assert.equal(metric.props.unit, 'Tokens')
-  const member = await mount(t, screen, { privateExports: ['MemberLedger'], exportName: 'MemberLedger', dependencies: dependencies({}), props: {
-    rows: [{ userId: 'one', label: '客户用药研发项目', sessions: 2, tokens: 1000 }], total: 1000, selected: '', onSelect: () => {},
+  const member = await mount(t, screen, { privateExports: ['UsageDetails'], exportName: 'UsageDetails', dependencies: dependencies({}), props: {
+    data: { users: [{ userId: 'one', label: '客户用药研发项目', sessions: 2, tokens: 1000 }] }, total: 1000,
   } })
-  assert.equal(textOf(member.nodes(node => node.type === 'th').at(-1)), '用量占比')
-  assert.ok(member.nodes(node => node.type === 'b').some(node => textOf(node) === '客户用药研发项目'), 'authored business names are not globally replaced')
+  member.act(() => member.nodes(node => node.props.id === 'ugc-tab-members')[0].props.onClick())
+  assert.equal(textOf(member.nodes(node => node.type === 'th').at(-2)), '用量占比')
+  assert.ok(member.nodes(node => node.type === 'button').some(node => textOf(node) === '客户用药研发项目'), 'authored business names are not globally replaced')
   const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date())
   const trend = await mount(t, chart, { exportName: 'TrendPanel', dependencies: dependencies({}), props: {
     days: 1, points: [{ key: today, tokens: 1000, sessions: 141 }],

@@ -1,9 +1,7 @@
-"""Durable account-owned conversation projections.
+"""Retained legacy PC history, recoverable only by its original account and device.
 
-The source device remains the only device allowed to append to a conversation.
-Other devices receive a read projection through the Hub. Native execution
-requires a separate authenticated admission claimed by the source device;
-the projection itself never grants transcript write access.
+New local publication and Hub-mediated native execution are retired. Existing
+bodies and receipts remain available under their recovery authorization.
 """
 import uuid
 from datetime import datetime, timezone
@@ -21,8 +19,8 @@ def _uuid() -> str:
 class PersonalConversationRelay(Base):
     """Admission receipt only; native execution remains in the source session.
 
-    A claimed command is never automatically replayed. The source PC must
-    acknowledge its durable local receipt; transcript sync owns result state.
+    Old commands are never dispatched or replayed after upgrade. The source PC
+    may still acknowledge its durable local receipt.
     """
     __tablename__ = "personal_conversation_relay"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)

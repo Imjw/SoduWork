@@ -11,6 +11,23 @@ const SOURCE_HASHES = new Map([
   ['2.6.2', 'f07d4f0d28ba1dd3397cb070aa757f7b7610a51bb15164f1e158fad7809cb36a'],
 ]);
 
+export function stepUsage(driver, event) {
+  const u = event.usage;
+  // Kimi leaves inputCacheRead absent when the provider omits its breakdown.
+  // In that case inputOther already contains the full reported prompt count.
+  const read = u?.inputCacheRead === undefined ? 0 : u.inputCacheRead;
+  if (!driver || !Number.isSafeInteger(event.step) || !u ||
+      ![u.inputOther, read, u.inputCacheCreation, u.output].every(
+        value => Number.isSafeInteger(value) && value >= 0)) return;
+  const total = u.inputOther + read + u.inputCacheCreation + u.output;
+  if (!Number.isSafeInteger(total) || !total) return;
+  driver.soduworkReportedSteps ??= new Set();
+  if (driver.soduworkReportedSteps.has(event.step)) return;
+  driver.soduworkReportedSteps.add(event.step);
+  return {inputTokens: u.inputOther, outputTokens: u.output, totalTokens: total,
+    ...(u.inputCacheRead === undefined ? {} : {cachedReadTokens: read}), cachedWriteTokens: u.inputCacheCreation};
+}
+
 export function settleTurnOutcome(driver, event, isAuthError, RequestError, mapStopReason) {
   if (event.reason === 'failed') {
     if (isAuthError(event.error)) {
@@ -51,12 +68,15 @@ export function transformSource(source, version) {
   source = replaceOnce(source, '\tagentEvents = {', `\tagentEvents = {
 \t\t"turn.step.completed": {
 \t\t\tkind: "stream", name: "events", type: "turn.step.completed",
-\t\t\tschema: object$1({type: literal("turn.step.completed"), turnId: number$1(), finishReason: string(), providerFinishReason: string().optional()})
+\t\t\tschema: object$1({type: literal("turn.step.completed"), turnId: number$1(), step: number$1().optional(), usage: unknown().optional(), finishReason: string(), providerFinishReason: string().optional()})
 \t\t},`);
   source = replaceOnce(source, '\t\t\t}), events.on("turn.ended", (event) => {',
     `\t\t\t}), events.on("turn.step.completed", (event) => {
 \t\t\t\tthis.dispatchTurnEvent(event.turnId, () => {
 \t\t\t\t\tconst driver = this.driverFor(event.turnId);
+\t\t\t\t\tconst usage = __soduworkKimiUsage(driver, event);
+\t\t\t\t\tif (usage) this.emit({sessionId: this.sessionId, update: {sessionUpdate: "agent_message_chunk",
+\t\t\t\t\t\tcontent: {type:"text",text:""}, _meta: {soduworkUsage: usage}}});
 \t\t\t\t\tif (driver !== void 0) driver.soduworkFinishReason = event.providerFinishReason === "truncated"
 \t\t\t\t\t\t? "max_tokens" : event.finishReason;
 \t\t\t\t});
@@ -68,7 +88,7 @@ export function transformSource(source, version) {
 \t\t\t\t}
 \t\t\t\tdriver.resolve({ stopReason: turnEndReasonToStopReason(event.reason, error) });`,
     '\t\t\t\t__soduworkKimiSettle(driver, event, isAuthError, RequestError$1, turnEndReasonToStopReason);');
-  const importLine = 'import { settleTurnOutcome as __soduworkKimiSettle } from '
+  const importLine = 'import { settleTurnOutcome as __soduworkKimiSettle, stepUsage as __soduworkKimiUsage } from '
     + JSON.stringify(import.meta.url) + ';\n';
   // The installed CLI has a hashbang which must remain its first source line.
   const firstLineEnd = source.startsWith('#!') ? source.indexOf('\n') + 1 : 0;

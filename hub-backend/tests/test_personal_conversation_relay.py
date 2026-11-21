@@ -1,4 +1,7 @@
 import importlib.util
+import hashlib
+import json
+import uuid
 import tempfile
 import unittest
 from datetime import timedelta
@@ -46,110 +49,130 @@ class PersonalRelayTests(unittest.IsolatedAsyncioTestCase):
         return dict(conversationId='conversation-1', targetClientId='pc', expectedRevision=8,
                     instruction='continue locally', **values)
 
-    async def prepare(self, request='m1', body=None):
-        return await api.prepare(request, body or self.body(), client=self.phone, session=self.session)
-
-    async def test_native_target_requires_current_same_account_heartbeat(self):
-        self.assertTrue((await api.target('conversation-1', self.phone, self.session))['available'])
-        self.pc.config = {api.PREFIX: {'owner': 'u2', 'protocol': 1, 'at': api.now().timestamp()}}
+    async def seed_legacy(self, request='m1', phase='prepared'):
+        # Represent pre-upgrade records directly; retired APIs cannot create them.
+        body = self.body()
+        row = Relay(id=str(uuid.uuid5(uuid.NAMESPACE_URL, "personal-relay:" + self.phone.id + ":" + request)),
+            owner_user_id='u1', requester_client_id=self.phone.id, source_client_id=self.pc.id,
+            conversation_id=self.source.id, active_conversation_id=self.source.id if request == 'm1' else None,
+            request_id=request, request_hash=hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True).encode()).hexdigest(),
+            instruction=body['instruction'], source_epoch='e1', source_revision=2,
+            phase=phase, reason='', expires_at=api.now() + timedelta(seconds=60))
+        self.session.add(row)
         await self.session.commit()
-        self.assertFalse((await api.target('conversation-1', self.phone, self.session))['available'])
-        with self.assertRaises(HTTPException): await self.prepare()
+        return row
 
-    async def test_foreign_account_cannot_discover_send_claim_or_ack(self):
-        for operation in [api.target('conversation-1', self.foreign, self.session),
-                          api.prepare('other', self.body(), self.foreign, self.session)]:
-            with self.assertRaises(HTTPException) as caught: await operation
+    async def gone(self, operation):
+        with self.assertRaises(HTTPException) as caught:
+            await operation
+        self.assertEqual(caught.exception.status_code, 410)
+
+    async def test_target_location_and_new_requests_are_retired_without_writing(self):
+        for identity in (self.phone, self.pc, self.foreign):
+            await self.gone(api.target('conversation-1', identity, self.session))
+            await self.gone(api.target('unknown', identity, self.session))
+            await self.gone(api.prepare('new', self.body(), identity, self.session))
+        self.assertEqual(list((await self.session.scalars(select(Relay))).all()), [])
+
+    async def test_foreign_account_cannot_read_or_ack_historical_receipts(self):
+        row = await self.seed_legacy(phase='claimed')
+        for operation in (api.status('m1', self.foreign, self.session),
+                          api.acknowledge(row.id, {'phase': 'accepted'}, self.foreign, self.session),
+                          api.acknowledge(row.id, {'phase': 'accepted'}, self.phone, self.session)):
+            with self.assertRaises(HTTPException) as caught:
+                await operation
             self.assertEqual(caught.exception.status_code, 404)
-        row = await self.prepare()
-        with self.assertRaises(HTTPException): await api.claim(row['id'], self.phone, self.session)
-        with self.assertRaises(HTTPException): await api.acknowledge(row['id'], {'phase': 'accepted'}, self.foreign, self.session)
+        await self.gone(api.claim(row.id, self.phone, self.session))
 
-    async def test_immutable_retry_and_exact_target(self):
-        first = await self.prepare()
-        self.assertEqual(first['id'], (await self.prepare())['id'])
-        changed = self.body(); changed['instruction'] = 'different'
-        with self.assertRaises(HTTPException): await self.prepare(body=changed)
-        changed = self.body(); changed['targetClientId'] = 'another-pc'
-        with self.assertRaises(HTTPException): await self.prepare('another', changed)
+    async def test_retired_retry_cannot_replace_existing_request_or_instruction(self):
+        row = await self.seed_legacy()
+        previous = (row.request_hash, row.instruction, row.source_client_id)
+        for body in (self.body(), {**self.body(), 'instruction': 'different'},
+                     {**self.body(), 'targetClientId': 'another-pc'}):
+            await self.gone(api.prepare('m1', body, self.phone, self.session))
+        await self.session.refresh(row)
+        self.assertEqual((row.request_hash, row.instruction, row.source_client_id), previous)
         self.assertEqual(len(list((await self.session.scalars(select(Relay))).all())), 1)
 
-    async def test_source_version_changes_reject_without_execution(self):
-        first = await self.prepare()
-        self.source.source_revision += 1
+    async def test_poll_never_releases_prepared_claimed_or_endpoint_instructions(self):
+        from unittest.mock import AsyncMock, patch
+        one = await self.seed_legacy('one')
+        two = await self.seed_legacy('two', 'claimed')
+        two.active_conversation_id = None
+        two.content_ref = {'runnerId': 'synthetic', 'scope': 'private'}
         await self.session.commit()
-        with self.assertRaises(HTTPException): await api.claim(first['id'], self.pc, self.session)
-        status = await api.status('m1', self.phone, self.session)
-        self.assertEqual(status['phase'], 'rejected')
+        config = dict(self.pc.config or {})
+        with patch('app.services.conversation_content.get_json', new_callable=AsyncMock) as read:
+            for protocol in ({}, {'discoveryProtocol': 1}):
+                result = await api.poll(self.pc, self.session, protocol)
+                self.assertEqual(result, {'requests': [], 'discoveryProtocol': 1, 'syncDisabled': True})
+            read.assert_not_awaited()
+        await self.session.refresh(self.pc)
+        self.assertEqual(self.pc.config, config)
+        self.assertEqual(one.phase, 'prepared')
+        self.assertEqual(two.phase, 'claimed')
 
-    async def test_claim_is_single_use_and_ack_is_idempotent(self):
-        first = await self.prepare()
-        self.assertEqual((await api.poll(self.pc, self.session))['requests'][0]['sourceSessionId'], 'native-1')
-        await api.claim(first['id'], self.pc, self.session)
-        with self.assertRaises(HTTPException): await api.claim(first['id'], self.pc, self.session)
-        await api.acknowledge(first['id'], {'phase': 'accepted'}, self.pc, self.session)
-        self.assertEqual((await api.acknowledge(first['id'], {'phase': 'accepted'}, self.pc, self.session))['phase'], 'accepted')
-        with self.assertRaises(HTTPException): await api.acknowledge(first['id'], {'phase': 'rejected'}, self.pc, self.session)
+    async def test_claim_never_releases_legacy_work_and_ack_requires_prior_claim(self):
+        row = await self.seed_legacy()
+        for _ in range(2):
+            await self.gone(api.claim(row.id, self.pc, self.session))
+        with self.assertRaises(HTTPException):
+            await api.acknowledge(row.id, {'phase': 'accepted'}, self.pc, self.session)
+        await self.session.refresh(row)
+        self.assertEqual(row.phase, 'prepared')
+
+    async def test_historical_ack_is_idempotent_fixed_and_does_not_store_body(self):
+        row = await self.seed_legacy(phase='claimed')
+        accepted = await api.acknowledge(row.id, {'phase': 'accepted', 'reason': 'must not persist private content'}, self.pc, self.session)
+        self.assertEqual(accepted['phase'], 'accepted')
+        self.assertNotIn('private content', accepted['reason'])
+        self.assertEqual(await api.acknowledge(row.id, {'phase': 'accepted'}, self.pc, self.session), accepted)
+        with self.assertRaises(HTTPException):
+            await api.acknowledge(row.id, {'phase': 'rejected'}, self.pc, self.session)
+        with self.assertRaises(HTTPException):
+            await api.acknowledge(row.id, {'phase': 'accepted', 'instruction': 'new'}, self.pc, self.session)
         self.assertEqual((await api.status('m1', self.phone, self.session))['phase'], 'accepted')
 
     async def test_unclaimed_expiry_does_not_execute_after_reconnect(self):
-        first = await self.prepare()
-        row = await self.session.get(Relay, first['id'])
+        row = await self.seed_legacy()
         row.expires_at = api.now() - timedelta(seconds=1)
         await self.session.commit()
         self.assertEqual((await api.poll(self.pc, self.session))['requests'], [])
         self.assertEqual((await api.status('m1', self.phone, self.session))['phase'], 'rejected')
-        with self.assertRaises(HTTPException): await api.claim(first['id'], self.pc, self.session)
+        await self.gone(api.claim(row.id, self.pc, self.session))
 
-    async def test_uncertain_delivery_blocks_new_request(self):
-        first = await self.prepare()
-        with self.assertRaises(HTTPException): await self.prepare('second')
-        await api.claim(first['id'], self.pc, self.session)
-        await api.acknowledge(first['id'], {'phase': 'uncertain'}, self.pc, self.session)
-        with self.assertRaises(HTTPException): await self.prepare('second')
+    async def test_uncertain_resolution_is_explicit_and_never_replays(self):
+        row = await self.seed_legacy(phase='claimed')
+        with self.assertRaises(HTTPException):
+            await api.resolve('m1', {'checkedOnSourcePC': True}, self.phone, self.session)
+        await api.acknowledge(row.id, {'phase': 'uncertain'}, self.pc, self.session)
+        for body, identity in (({}, self.phone), ({'checkedOnSourcePC': True}, self.foreign)):
+            with self.assertRaises(HTTPException):
+                await api.resolve('m1', body, identity, self.session)
+        self.assertEqual((await api.resolve('m1', {'checkedOnSourcePC': True}, self.phone, self.session))['phase'], 'closed')
         self.assertEqual((await api.poll(self.pc, self.session))['requests'], [])
+        await self.gone(api.claim(row.id, self.pc, self.session))
+        await self.gone(api.prepare('second', self.body(), self.phone, self.session))
 
-    async def test_logout_or_reassigned_source_cannot_receive(self):
-        first = await self.prepare()
+    async def test_logout_or_reassigned_source_cannot_read_receipts(self):
+        row = await self.seed_legacy(phase='claimed')
         self.pc.user_ref = 'u2'
         await self.session.commit()
         self.assertEqual((await api.poll(self.pc, self.session))['requests'], [])
-        with self.assertRaises(HTTPException): await api.claim(first['id'], self.pc, self.session)
-        with self.assertRaises(HTTPException): await api.status('m1', self.phone, self.session)
-
-    async def test_stale_busy_and_archived_sources_are_not_admitted(self):
-        body = self.body(); body['expectedRevision'] = 7
-        with self.assertRaises(HTTPException): await self.prepare(body=body)
-        self.source.state = 'responding'
-        await self.session.commit()
-        with self.assertRaises(HTTPException): await self.prepare()
-        self.source.state, self.source.archived = 'idle', True
-        await self.session.commit()
-        with self.assertRaises(HTTPException): await self.prepare()
-
-    async def test_uncertain_resolution_is_explicit_and_never_replays(self):
-        first = await self.prepare()
         with self.assertRaises(HTTPException):
-            await api.resolve('m1', {'checkedOnSourcePC': True}, self.phone, self.session)
-        await api.claim(first['id'], self.pc, self.session)
-        await api.acknowledge(first['id'], {'phase': 'uncertain'}, self.pc, self.session)
-        with self.assertRaises(HTTPException): await api.resolve('m1', {}, self.phone, self.session)
+            await api.status('m1', self.phone, self.session)
         with self.assertRaises(HTTPException):
-            await api.resolve('m1', {'checkedOnSourcePC': True}, self.foreign, self.session)
-        result = await api.resolve('m1', {'checkedOnSourcePC': True}, self.phone, self.session)
-        self.assertEqual(result['phase'], 'closed')
-        with self.assertRaises(HTTPException): await api.claim(first['id'], self.pc, self.session)
-        self.assertEqual((await self.prepare('second'))['phase'], 'prepared')
+            await api.acknowledge(row.id, {'phase': 'accepted'}, self.pc, self.session)
 
-    async def test_archiving_after_send_does_not_hide_the_receipt(self):
-        first = await self.prepare()
-        await api.claim(first['id'], self.pc, self.session)
+    async def test_archiving_after_send_does_not_hide_the_historical_receipt(self):
+        row = await self.seed_legacy(phase='claimed')
         self.source.archived = True
         await self.session.commit()
-        await api.acknowledge(first['id'], {'phase': 'accepted'}, self.pc, self.session)
+        await api.acknowledge(row.id, {'phase': 'accepted'}, self.pc, self.session)
         self.assertEqual((await api.status('m1', self.phone, self.session))['phase'], 'accepted')
 
     async def test_http_device_auth_and_cross_account_boundaries(self):
+        row = await self.seed_legacy('http-request', 'claimed')
         application = FastAPI()
         application.include_router(api.router)
         async def database():
@@ -161,15 +184,14 @@ class PersonalRelayTests(unittest.IsolatedAsyncioTestCase):
             phone = {'Authorization': 'Device ' + device_auth.issue_session(self.phone)[0]}
             pc = {'Authorization': 'Device ' + device_auth.issue_session(self.pc)[0]}
             foreign = {'Authorization': 'Device ' + device_auth.issue_session(self.foreign)[0]}
-            self.assertEqual((await http.get(base + '/targets/conversation-1', headers=foreign)).status_code, 404)
-            self.assertTrue((await http.get(base + '/targets/conversation-1', headers=phone)).json()['available'])
-            created = await http.post(base + '/requests/http-request', headers=phone, json=self.body())
-            self.assertEqual(created.status_code, 200, created.text)
-            rid = created.json()['id']
-            self.assertEqual((await http.post(base + '/claims/' + rid, headers=phone)).status_code, 404)
-            self.assertEqual((await http.post(base + '/claims/' + rid, headers=pc)).status_code, 200)
-            self.assertEqual((await http.post(base + '/acks/' + rid, headers=pc, json={'phase': 'accepted'})).status_code, 200)
+            self.assertEqual((await http.get(base + '/targets/conversation-1', headers=foreign)).status_code, 410)
+            self.assertEqual((await http.get(base + '/targets/conversation-1', headers=phone)).status_code, 410)
+            self.assertEqual((await http.post(base + '/requests/new', headers=phone, json=self.body())).status_code, 410)
+            self.assertEqual((await http.post(base + '/claims/' + row.id, headers=pc)).status_code, 410)
+            self.assertEqual((await http.post(base + '/acks/' + row.id, headers=phone, json={'phase': 'accepted'})).status_code, 404)
+            self.assertEqual((await http.post(base + '/acks/' + row.id, headers=pc, json={'phase': 'accepted'})).status_code, 200)
             self.assertEqual((await http.get(base + '/requests/http-request', headers=phone)).json()['phase'], 'accepted')
+            self.assertEqual((await http.get(base + '/requests/http-request', headers=foreign)).status_code, 404)
             self.pc.auth_version += 1
             await self.session.commit()
             self.assertEqual((await http.post(base + '/poll', headers=pc)).status_code, 401)
@@ -181,16 +203,37 @@ class MigrationTests(unittest.TestCase):
             Path(__file__).resolve().parents[1] / 'migrations/versions/0074_personal_conversation_relay.py')
         migration = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(migration)
+        endpoint_spec = importlib.util.spec_from_file_location('endpoint_migration',
+            Path(__file__).resolve().parents[1] / 'migrations/versions/0082_endpoint_conversation_content.py')
+        endpoint = importlib.util.module_from_spec(endpoint_spec)
+        endpoint_spec.loader.exec_module(endpoint)
         engine = create_engine('sqlite://')
         try:
             with engine.begin() as connection:
                 connection.exec_driver_sql('CREATE TABLE preserved (id INTEGER PRIMARY KEY)')
+                connection.exec_driver_sql('INSERT INTO preserved VALUES (42)')
+                connection.exec_driver_sql('CREATE TABLE account_conversation (id TEXT PRIMARY KEY)')
+                for table, column in (("automation_execution_event", "detail"),
+                                      ("conversation_handoff", "options"),
+                                      ("conversation_message_receipt", "payload"),
+                                      ("ai_schedule_run", "receipt")):
+                    connection.exec_driver_sql(f'CREATE TABLE {table} ({column} TEXT)')
+                preserved_tables = inspect(connection).get_table_names()
+                original_columns = {"id", "owner_user_id", "requester_client_id", "source_client_id",
+                    "conversation_id", "active_conversation_id", "request_id", "request_hash", "instruction",
+                    "source_epoch", "source_revision", "phase", "reason", "created_at", "expires_at"}
                 with Operations.context(MigrationContext.configure(connection)):
                     migration.upgrade()
                     columns = {row['name'] for row in inspect(connection).get_columns(Relay.__tablename__)}
+                    self.assertEqual(columns, original_columns)
+                    endpoint.upgrade()
+                    columns = {row['name'] for row in inspect(connection).get_columns(Relay.__tablename__)}
                     self.assertEqual(columns, set(Relay.__table__.columns.keys()))
+                    endpoint.downgrade()
+                    self.assertEqual({row['name'] for row in inspect(connection).get_columns(Relay.__tablename__)}, original_columns)
                     migration.downgrade()
-                self.assertEqual(inspect(connection).get_table_names(), ['preserved'])
+                self.assertEqual(inspect(connection).get_table_names(), preserved_tables)
+                self.assertEqual(connection.exec_driver_sql('SELECT id FROM preserved').all(), [(42,)])
         finally:
             engine.dispose()
 

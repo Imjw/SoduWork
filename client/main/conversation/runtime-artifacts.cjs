@@ -10,7 +10,7 @@ const metadataKeys = ['artifactId', 'kind', 'name', 'title', 'summary', 'relativ
   'pluginDraft', 'pluginPackage', 'skillPackage', 'pluginName', 'pluginVersion',
   'pluginIdentity', 'pluginSuperseded', 'pluginRevision', 'pluginRevisionAt'];
 const stamp = stat => [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].map(String);
-const same = (a, b) => Array.isArray(a) && a.length === b.length && a.every((value, index) => value === b[index]);
+const same = (a, b) => Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((value, index) => value === b[index]);
 
 function target(root, relative) {
   if (typeof relative !== 'string' || !relative || relative.includes('\\') || relative.includes('\0') ||
@@ -70,4 +70,17 @@ function restore(cwd, history, current = []) {
   return files;
 }
 
-module.exports = { capture, restore };
+function forContinuation(cwd, recovered, previous) {
+  if (!recovered && !previous) return undefined;
+  const files = restore(cwd, recovered);
+  files.push(...restore(cwd, previous, files));
+  if (!files.length) return undefined;
+  try {
+    return capture(cwd, { items: files });
+  } catch (error) {
+    if (['ENOENT', 'ENOTDIR', 'ELOOP'].includes(error.code)) return undefined;
+    throw error;
+  }
+}
+
+module.exports = { capture, restore, forContinuation, stamp, same };

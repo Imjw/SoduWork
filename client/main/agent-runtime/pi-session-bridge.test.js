@@ -75,6 +75,113 @@ test('Pi bridge opens a real legacy handle through the runtime registry', async 
   await bridge.dispose();
 });
 
+test('independent device history opens a new native segment under the original public identity', async t => {
+  const fs = require('node:fs'), path = require('node:path'), os = require('node:os');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'device-history-resume-'));
+  const app = { getPath: () => root }, identity = require('../../tests/helpers/platform-session-fixture.cjs').identity();
+  const raw = fakeSessionModule(), open = raw.open, bindings = [];
+  raw.open = async options => {
+    const result = await open(options);
+    result.session.bindTask = async (id, title) => { bindings.push({ id, title }); return { ok: true }; };
+    return result;
+  };
+  const bridge = createPiSessionBridge({ app, sessionModule: raw, runnerAdapters: [] });
+  t.after(async () => { await bridge.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
+  const recovery = { row: { id: 'original-public-id', title: 'Saved task', adapterId: 'pi',
+    taskBindings: [{ taskId: 'task-one', title: 'Existing task' }] },
+    prefix: { messages: [{ role: 'user', text: 'Completed historical request' }], tools: [
+      { id: 'receipt', name: 'write', state: 'done', result: 'Already written', after: 0 }] },
+    historyRecovery: { mode: 'device-history', nativeArchiveMissing: true } };
+  const result = await bridge.open({ app, identity, cwd: root, ref: 'restored-window', deviceHistoryRecovery: recovery });
+  assert.equal(result.ok, true);
+  assert.equal(result.session.sessionId, 'original-public-id');
+  assert.equal(raw.handles[0].sessionId, 'pi-1');
+  assert.equal(raw.opened[0].resumePath, undefined);
+  assert.match(raw.opened[0].contextPrompts.join('\n'), /Completed historical request/);
+  assert.match(raw.opened[0].contextPrompts.join('\n'), /Already written/);
+  assert.match(raw.opened[0].contextPrompts.join('\n'), /task-one/);
+  assert.doesNotMatch(raw.opened[0].contextPrompts.join('\n'), /user explicitly changed Agent/);
+  assert.equal(result.session.snapshot().messages[0].text, 'Completed historical request');
+  assert.equal(result.session.snapshot().tools[0].result, 'Already written');
+  assert.equal(result.session.snapshot().historyRecovery.nativeArchiveMissing, true);
+  assert.deepEqual(bindings, [{ id: 'task-one', title: 'Existing task' }]);
+  const record = require('../conversation/runtime-segments').read(app, 'original-public-id');
+  assert.equal(record.deviceHistoryComplete, true);
+  assert.equal(record.active.sessionId, 'pi-1');
+  assert.equal(record.deviceHistoryContext.taskBindings[0].taskId, 'task-one');
+});
+
+test('a passive desktop history view can coexist with execution and closes independently', async t => {
+  const raw = fakeSessionModule(), bridge = createPiSessionBridge({ sessionModule: raw, runnerAdapters: [] });
+  t.after(() => bridge.dispose());
+  let closed = 0;
+  const history = { ref: 'reader', sessionId: 'pi-1', readOnly: true, localReplica: true,
+    snapshot: () => ({ messages: [{ role: 'user', text: 'Past turn' }] }),
+    close: async () => { closed++; return true; } };
+  const view = bridge.attachView(history, { historyPreview: true });
+  assert.equal(bridge.get('reader'), view);
+  assert.equal(bridge.findBySessionId('pi-1'), null);
+  assert.throws(() => bridge.attachView({ ...history, ref: 'writable', readOnly: false }, { historyPreview: true }));
+  const result = await bridge.open({ ref: 'live' });
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(await view.close(), true);
+  assert.equal(closed, 1);
+  assert.equal(bridge.get('reader'), null);
+  assert.equal(bridge.findBySessionId('pi-1'), result.session);
+  assert.equal(raw.handles[0].closed, false);
+});
+
+test('selecting a new runtime for a saved transcript retains its native lineage across repeated opens', async t => {
+  const fs = require('node:fs'), path = require('node:path'), os = require('node:os');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'device-history-selection-'));
+  const app = { getPath: () => root }, identity = require('../../tests/helpers/platform-session-fixture.cjs').identity();
+  const raw = fakeSessionModule(), bridge = createPiSessionBridge({ app, sessionModule: raw, runnerAdapters: [] });
+  t.after(async () => { await bridge.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
+  const segments = require('../conversation/runtime-segments');
+  const original = { sessionId: 'recorded-run', adapterId: 'retired-adapter', path: 'original-session' };
+  const previous = { sessionId: 'previous-run', adapterId: 'qwen', path: 'previous-session' };
+  const row = { id: 'logical-chat', adapterId: previous.adapterId, modelName: 'retired-model' };
+  const artifacts = require('../conversation/runtime-artifacts.cjs');
+  function indexedFile(name, source) {
+    const file = path.join(root, name);
+    fs.writeFileSync(file, name);
+    const stat = fs.statSync(file);
+    return artifacts.capture(root, { items: [{ artifactId: name, path: file, at: Math.round(stat.mtimeMs),
+      size: stat.size, primary: true }] }, source);
+  }
+  const oldImage = indexedFile('old.png', original);
+  const retired = indexedFile('removed.png', original);
+  oldImage.items.push(...retired.items);
+  fs.unlinkSync(path.join(root, 'removed.png'));
+  const recoveredPage = indexedFile('index.html', previous);
+  await segments.save(app, { id: row.id, version: 1, owner: segments.scope(identity), originAdapter: original.adapterId,
+    segments: [original], active: previous, artifactHistory: oldImage });
+  const recovery = { row, artifactHistory: recoveredPage, prefix: { messages: [{ role: 'user', text: 'Earlier turn' }], tools: [] },
+    historyRecovery: { mode: 'device-history', nativeArchiveMissing: false } };
+  const options = { app, identity, cwd: root, adapterId: 'pi', modelName: 'new-selection', deviceHistoryRecovery: recovery };
+  const [first, duplicate] = await Promise.all([bridge.open({ ...options, ref: 'new' }), bridge.open({ ...options, ref: 'duplicate' })]);
+  assert.equal(first.ok, true, first.reason);
+  assert.equal(duplicate.ok, false);
+  assert.equal(raw.opened.length, 1);
+  assert.equal(raw.opened[0].modelName, 'new-selection');
+  assert.equal(raw.opened[0].startDeviceSegment, true);
+  assert.equal(raw.opened[0].deviceHistoryRecovery, undefined);
+  assert.equal(raw.opened[0].resumePath, undefined);
+  assert.equal(first.session.sessionId, row.id);
+  const saved = segments.read(app, row.id);
+  assert.equal(saved.originAdapter, original.adapterId);
+  assert.deepEqual(saved.segments, [original, previous]);
+  assert.equal(saved.active.adapterId, 'pi');
+  assert.equal(saved.active.sessionId, raw.handles[0].sessionId);
+  const files = artifacts.restore(root, saved.artifactHistory);
+  assert.deepEqual(files.map(file => file.relative).sort(), ['index.html', 'old.png']);
+  assert.ok(files.every(file => file.historical && !file.primary));
+  assert.deepEqual(artifacts.restore(path.dirname(root), saved.artifactHistory), []);
+  assert.equal(raw.opened[0].artifactHistory, undefined);
+  await assert.rejects(segments.save(app, { ...saved, segments: Array(1001).fill(previous) }), /达到上限/);
+  assert.deepEqual(segments.read(app, row.id), saved);
+});
+
 test('native replay rechecks an indexed failure after the unavailable handle finishes disposal', async () => {
   const raw = fakeSessionModule(), bridge = createPiSessionBridge({ sessionModule: raw, runnerAdapters: [] });
   let indexed = { state: 'completed' }, release;
@@ -107,6 +214,8 @@ test('Pi task binding mismatch remains a typed refusal through the runtime adapt
     assert.equal(result.runtimeError, 'TASK_BINDING_MISMATCH');
     assert.equal(bridge.get('wrong-task'), null);
   }
+  raw.open = async () => ({ ok: false, code: 'LOCAL_HISTORY_MODEL_UNAVAILABLE', reason: 'Missing recorded local model' });
+  assert.equal((await bridge.open({ resumePath: 'old-session.jsonl' })).runtimeError, 'LOCAL_HISTORY_MODEL_UNAVAILABLE');
   raw.open = async () => ({ ok: false, reason: '其他初始化失败' });
   const failed = await bridge.open({ ref: 'ordinary-error' });
   assert.equal(failed.code, undefined, 'unrelated failures must not trigger task mapping recovery');

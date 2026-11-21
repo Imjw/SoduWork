@@ -39,6 +39,61 @@ for(const code of ['ACCOUNT_HISTORY_UNAVAILABLE','SESSION_FORBIDDEN','OWNER_MISM
   });
 }
 
+test('desktop preview keeps its transcript, draft and handle across failed activation and only releases it after a writable reply', async () => {
+  const preview = { ...opened('original'), ref: 'preview-original', localReplica: true,
+    snapshot: { messages: [{ role: 'assistant', text: 'Retained reply' }], localReplica: true,
+      execution: { readOnly: true, canContinueOnDevice: true } } };
+  const f = fixture((options, index) => index === 1 ? preview : index === 2 ? { ok: false, reason: 'Model unavailable' } : opened('original'));
+  assert.equal(await f.controller._ensure('original'), true);
+  assert.equal(f.opens[0].historyIntent, 'view');
+  f.ctx._sessionOptions.adapterId = 'pi';
+  f.ctx._sessionOptions.modelName = 'current-account-model';
+  f.ctx._sessionOptions.taskRef = 'old-draft-task';
+  assert.equal(await f.controller._ensure('original', preview.ref), false);
+  assert.equal(f.opens[1].historyIntent, 'continue');
+  assert.equal(f.opens[1].adapterId, 'pi');
+  assert.equal(f.opens[1].modelName, 'current-account-model');
+  assert.equal(Object.hasOwn(f.opens[1], 'accessDraftId'), false, 'An absent consent must not reserve a new-chat grant');
+  assert.equal(Object.hasOwn(f.opens[1], 'accessConsentId'), false);
+  assert.equal(f.opens[1].taskRef, undefined);
+  delete f.ctx._sessionOptions.taskRef;
+  assert.equal(f.ctx._ref, preview.ref);
+  assert.equal(f.ctx._snap.messages[0].text, 'Retained reply');
+  assert.equal(f.input.value, 'Retained review draft');
+  assert.deepEqual(f.released, []);
+  assert.equal(await f.controller._ensure('original', preview.ref), true);
+  assert.equal(f.ctx._ref, 'ref-original');
+  assert.deepEqual(f.released, [preview.ref]);
+  assert.equal(f.sends.length, 0);
+});
+
+test('an account change during preview activation releases only the late writable handle', async () => {
+  const pending = deferred(), f = fixture(() => pending.promise);
+  f.ctx._ref = 'preview-original'; f.ctx._sessionId = 'original';
+  f.ctx._snap = { localReplica: true, execution: { canContinueOnDevice: true } };
+  const changing = f.controller._ensure('original', 'preview-original');
+  await tick();
+  f.owner('account-b'); f.ctx._viewEpoch++; f.ctx._ref = 'unrelated-live'; f.ctx._sessionId = 'other';
+  pending.resolve(opened('original'));
+  assert.equal(await changing, false);
+  assert.equal(f.ctx._ref, 'unrelated-live');
+  assert.deepEqual(f.released, ['ref-original']);
+  assert.equal(f.sends.length, 0);
+});
+
+test('a view-only history rejects typed and programmatic sends before composer or runtime work', async () => {
+  const f = fixture(() => { throw Error('must not execute'); });
+  f.ctx._ref = 'preview-original';
+  f.ctx._sessionId = 'original';
+  f.ctx._snap = { localReplica: true, execution: { readOnly: true, canContinueOnDevice: false },
+    historyRecovery: { incomplete: true, reason: 'A tool outcome is unknown' } };
+  f.ctx._mount = () => { throw Error('must not consume draft'); };
+  assert.equal(await f.controller._sendCore(), false);
+  assert.equal(await f.controller._sendCore('Retry tool'), false);
+  assert.equal(f.input.value, 'Retained review draft');
+  assert.equal(f.sends.length, 0);
+});
+
 test('a thrown native open is a blocked archive failure rather than permission to start a new chat',async()=>{
   const f=fixture(async()=>{throw Error('Synthetic IPC failure');});
   assert.equal(await f.controller._ensure('original'),false);

@@ -11,6 +11,12 @@ const { create } = require('../main/conversation/shared-history.cjs');
 const { createPiSessionBridge } = require('../main/agent-runtime/pi-session-bridge');
 const { identity } = require('./helpers/platform-session-fixture.cjs');
 
+function desktopEvent() {
+  const sender = { mainFrame: {}, isDestroyed: () => false,
+    getURL: () => require('node:url').pathToFileURL(path.resolve(__dirname, '../desk.html')).href };
+  return { sender, senderFrame: sender.mainFrame };
+}
+
 async function fixture(t, count = 123) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'soduwork-local-pages-'));
   const app = { getPath: () => root };
@@ -52,7 +58,7 @@ async function fixture(t, count = 123) {
     } };
 }
 
-test('local metadata pages restore only their account across A to B to A and cold store reopen', async t => {
+test('ordinary device metadata pages survive A to B to A and cold store reopen without account discovery', async t => {
   const f = await fixture(t);
   let workspace;
   for (const account of ['a', 'b', 'a']) {
@@ -62,14 +68,14 @@ test('local metadata pages restore only their account across A to B to A and col
       const reply = await f.read({ limit: 17, after, catalogRevision: catalog?.revision });
       assert.equal(reply.ok, true);
       assert.ok(reply.chats.length <= 17);
-      if (!after) { catalog = reply.localCatalog; assert.equal(catalog.items.length, account === 'a' ? 123 : 0); }
+      if (!after) { catalog = reply.localCatalog; assert.equal(catalog.items.length, 123); }
       else assert.equal(Object.hasOwn(reply.localCatalog, 'items'), false);
       workspace ||= reply.localCatalog.workspace;
       if (account === 'a') assert.equal(reply.localCatalog.workspace, workspace);
       else assert.notEqual(reply.localCatalog.workspace, workspace);
       rows.push(...reply.chats); after = reply.next;
     } while (after);
-    assert.equal(rows.length, account === 'a' ? 123 : 0);
+    assert.equal(rows.length, 123);
     assert.equal(new Set(rows.map(row => row.id)).size, rows.length);
     assert.ok(rows.every(row => row.localReplica === true && row.id.startsWith('local-')));
     assert.ok(catalog.items.every(row => !Object.hasOwn(row, 'title') && !Object.hasOwn(row, 'creator')));
@@ -125,6 +131,51 @@ test('native refresh discovers more than fifty real Pi archives and retains the 
   assert.match(retained.refreshError, /Native engine unavailable/);
 });
 
+test('desktop history IPC includes ordinary chats across accounts in local, merged and archived views', async t => {
+  const f = await fixture(t, 2), handlers = new Map(), event = desktopEvent();
+  const auth = require('../main/device-auth'), { scope } = require('../main/platform-connections/runtime.cjs');
+  let current = identity();
+  t.mock.method(auth, 'identity', () => current);
+  t.mock.method(auth, 'session', () => current.session);
+  t.mock.method(auth, 'profiles', () => []);
+  t.mock.method(auth, 'localOwner', () => scope(current));
+  const ipcMain = { handle: (name, fn) => handlers.set(name, fn) };
+  require('../main/pi-session/environment-ipc').install({ app: f.app, session: f.bridge, ipcMain });
+  require('../main/pi-session/history-ipc').install({ app: f.app, session: f.bridge, ipcMain, BrowserWindow: {} });
+  f.bridge.setExternalHistory({ history: async () => ({ ok: true, chats: [] }) });
+  await f.store.register([{ id: 'private-task', creator: { account: 'one', hub: current.hub },
+    historyProtection: 'account', workOwner: scope(current), adapterId: 'pi', at: 8, count: 1 }]);
+  await f.store.lifecycle('local-00001', 'archive');
+  const read = (opts, caller = event) => handlers.get('pi-session-history')(caller, opts);
+  const archived = (caller = event) => handlers.get('pi-session-history-archived')(caller);
+  const ids = result => { assert.equal(result.ok, true, result.reason); return result.chats.map(row => row.id).sort(); };
+  for (const account of ['b', 'a']) {
+    f.switch(account);
+    current = account === 'a' ? identity() : identity('two');
+    const active = account === 'a' ? ['local-00000', 'private-task'] : ['local-00000'];
+    const local = await read({ source: 'local' });
+    assert.ok(local.localCatalog.items.some(row => row.id === 'local-00000'));
+    assert.deepEqual(ids(local), active);
+    const merged = await read();
+    assert.deepEqual(ids(merged), active);
+    assert.ok(merged.chats.every(row => !Object.hasOwn(row, 'workOwner')));
+    assert.ok(merged.lifecycle.some(row => row.id === 'local-00001'));
+    assert.deepEqual(ids(await read({ source: 'account' })), []);
+    assert.deepEqual(ids(await read({ source: 'local', archived: true })), ['local-00001']);
+    assert.deepEqual(ids(await archived()), ['local-00001']);
+    if (account === 'b') {
+      const childFrame = { ...event, senderFrame: {} };
+      const child = await read({ source: 'local' }, childFrame);
+      assert.equal(child.ok, false);
+      assert.equal(child.localCatalog, undefined);
+      const childMerged = await read(undefined, childFrame);
+      assert.deepEqual(ids(childMerged), []);
+      assert.ok(childMerged.lifecycle.every(row => !row.localReplica));
+      assert.deepEqual(ids(await archived(childFrame)), []);
+    }
+  }
+});
+
 test('main local history rejects anonymous reads and an account change during discovery', async t => {
   const f = await fixture(t, 42), handlers = new Map();
   const auth = require('../main/device-auth');
@@ -133,7 +184,7 @@ test('main local history rejects anonymous reads and an account change during di
   t.after(() => Object.assign(auth, previous));
   require('../main/pi-session/environment-ipc').install({ app: f.app, session: f.bridge,
     ipcMain: { handle: (name, fn) => handlers.set(name, fn) } });
-  const read = options => handlers.get('pi-session-history')(null, options);
+  const read = options => handlers.get('pi-session-history')(desktopEvent(), options);
   const anonymous = await read({ source: 'local' });
   assert.equal(anonymous.ok, false);
   assert.equal(anonymous.chats.length, 0);
@@ -222,14 +273,14 @@ test('local catalog retains aliases and lifecycle tombstones and advances for al
   assert.deepEqual((await f.read()).localCatalog, next.localCatalog);
 });
 
-test('downloaded source locators retain resolver precedence without becoming native lifecycle aliases', async t => {
+test('downloaded cloud source locators retain resolver precedence without becoming native lifecycle aliases', async t => {
   const f = await fixture(t, 0);
   const { identity } = require('./helpers/platform-session-fixture.cjs');
   await f.store.register([{ id: 'native-direct', at: 1, historyAliasIds: ['explicit-source'], creator: { account: 'one', hub: identity().hub } }]);
   const capture = (actor, at, sourceSessionId) => f.capture({
     snapshot: () => ({ messages: [{ role: 'user', text: 'Synthetic downloaded history' }] }),
     historyRow: () => ({ id: 'account-original', title: 'Same title is not an alias', at,
-      adapterId: 'account-sync', accountProjection: true, sourceSessionId }),
+      adapterId: 'pi', cloud: true, locationMode: 'remote', sourceSessionId }),
   }, actor);
   await capture(identity(), 10, 'explicit-source');
   await capture(identity('two'), 20, 'source-native');
@@ -256,7 +307,7 @@ test('downloaded source locators retain resolver precedence without becoming nat
   assert.equal(JSON.stringify(deleted.localCatalog).includes('Same title'), false);
 });
 
-test('real account directory and local replica remain separate through bridge, IPC, paging and local deletion', async t => {
+test('legacy account directory and explicitly imported replica remain separate through bridge, IPC and local deletion', async t => {
   const f = await fixture(t, 0), handlers = new Map();
   const actor = require('./helpers/platform-session-fixture.cjs').identity();
   const auth = require('../main/device-auth');
@@ -287,8 +338,10 @@ test('real account directory and local replica remain separate through bridge, I
   const original = first.chats.find(row => row.id === 'acct-original');
   assert.ok(original?.accountProjection);
   assert.equal(original.accountCanSend, true);
-  await f.capture({ historyRow: () => original,
-    snapshot: () => ({ messages: [{ role: 'user', text: 'Downloaded synthetic transcript' }] }) }, actor);
+  await f.store.register([{ id: 'explicitly-imported-copy', cached: true, importedHistory: true,
+    source: { id: original.id, hub: actor.hub, account: 'one' }, title: original.title }]);
+  await f.store.cache('explicitly-imported-copy', [{ role: 'user', text: 'Downloaded synthetic transcript' }],
+    { expectedRevision: 0, complete: true });
   const copy = (await f.read()).chats[0];
   assert.ok(copy.cached && copy.id !== original.id);
   const all = [...first.chats]; let after = first.next;

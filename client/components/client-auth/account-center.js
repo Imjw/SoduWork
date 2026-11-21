@@ -200,6 +200,10 @@
       catch (error) { if (load !== deviceListRevision) return false; throw error; }
       if (load !== deviceListRevision) return false;
       content.innerHTML = '<h3>登录设备</h3><p class="ac-muted">可删除其他登录设备。删除后，该设备需要重新登录。</p><div class="ac-device-list"></div><p class="ac-status" role="status"></p>';
+      const direct = document.createElement('button'); direct.type = 'button'; direct.className = 'ac-secondary';
+      direct.textContent = '本人设备直连与会话迁移';
+      direct.onclick = () => { if (alive(stamp)) global.DeviceDirect?.open(); };
+      content.appendChild(direct);
       const list = content.querySelector('.ac-device-list');
       for (const item of result.items || []) {
         const row = document.createElement('div'); row.className = 'ac-setting-row'; row.dataset.deviceId = item.id;

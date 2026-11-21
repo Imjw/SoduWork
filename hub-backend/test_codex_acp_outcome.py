@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from app.services import acp_bridge as bridge, codex_acp_outcome as outcome, runner_sources
+from app.services import acp_bridge as bridge, codex_acp_outcome as outcome, codex_image_history, runner_sources
 
 
 def prompt_result(item, version=1):
@@ -131,7 +131,19 @@ class CodexAcpOutcomeTests(unittest.TestCase):
 
     def test_runner_source_closure_includes_the_typed_failure_parser(self):
         backend = Path(__file__).resolve().parent
-        self.assertIn(Path(outcome.__file__), runner_sources.build_inputs(backend, backend.parent))
+        sources = runner_sources.build_inputs(backend, backend.parent)
+        self.assertIn(Path(outcome.__file__), sources)
+        self.assertIn(Path(codex_image_history.__file__), sources)
+
+    def test_single_notification_tool_has_a_terminal_receipt(self):
+        acp = bridge.AcpBridge([], self.temp.name, "codex-harness", "readonly")
+        events = []
+        with patch.object(bridge, "_emit", side_effect=events.append):
+            for key, status in (("image", "completed"), ("bad-image", "failed"), ("pending", "in_progress")):
+                acp._update(tool_update(key, sessionUpdate="tool_call", title="View image", kind="read", status=status))
+        ended = [(e["toolCallId"], e["isError"]) for e in events if e["type"] == "tool_execution_end"]
+        self.assertEqual(ended, [("image", False), ("bad-image", True)])
+        self.assertEqual(sum(e["type"] == "tool_use" for e in events), 3)
 
     def test_real_bridge_retains_command_output_and_prefers_explicit_tool_errors(self):
         acp = bridge.AcpBridge([], self.temp.name, "codex-harness", "readonly")
@@ -149,6 +161,77 @@ class CodexAcpOutcomeTests(unittest.TestCase):
         self.assertEqual([(event["toolCallId"], event["result"], event["isError"]) for event in ended],
                          [("command", "first second", False), ("failed", "Actual native tool error", True)])
         self.assertFalse(acp.transition.busy())
+
+
+class CodexImageHistoryTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix="soduwork-image-history-")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name).resolve()
+        self.store = self.root / "local-runs"
+        self.archive = self.store / "run-1"
+        self.archive.mkdir(parents=True)
+        self.sid = "00000000-0000-7000-8000-000000000001"
+        self.receipt = self.root / ".codex-harness" / "sessions" / "1970/01/01" / f"rollout-1970-01-01T00-00-00-{self.sid}.jsonl"
+        self.receipt.parent.mkdir(parents=True)
+        self.metadata = {"ref": "run-1", "eventDestination": "local", "cli": "codex-harness",
+                         "cliSid": self.sid, "seq": 5, "ws": str(self.root / "work")}
+        self.header = {"type": "session_meta", "payload": {"id": self.sid, "cwd": self.metadata["ws"]}}
+        self.call = {"type": "response_item", "payload": {"type": "function_call", "name": "view_image",
+                     "arguments": json.dumps({"path": "/sample.png"}), "call_id": "image-1"}}
+        self.output = {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "image-1",
+                       "output": [{"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U="}]}}
+        self.request = {"ref": "run-1", "revision": 5, "calls": [{"callId": "image-1", "path": "/sample.png"}]}
+
+    def read(self, *rows, meta=None, request=None):
+        (self.archive / "meta.json").write_text(json.dumps(meta if meta is not None else self.metadata))
+        self.receipt.write_text("\n".join(map(json.dumps, rows)))
+        return codex_image_history.lookup(str(self.store), request if request is not None else self.request)
+
+    def test_returns_only_exact_locally_bound_native_image_receipt_ids(self):
+        result = self.read(self.header, self.call, self.output)
+        binding = result.pop("binding")
+        self.assertRegex(binding, r"^[a-f0-9]{64}$")
+        self.assertEqual(result, {"ref": "run-1", "revision": 5, "callIds": ["image-1"]})
+        self.receipt.unlink()
+        missing = codex_image_history.lookup(str(self.store), self.request)
+        self.assertEqual(missing, {**result, "binding": binding, "archiveMissing": True, "callIds": []})
+        with patch.object(codex_image_history.os, "scandir", side_effect=PermissionError()):
+            self.assertEqual(codex_image_history.lookup(str(self.store), self.request), {})
+        for rows in ([self.call], [self.output], [self.output, self.call], [self.call, self.call, self.output],
+                     [self.call, self.output, self.output], [self.call, self.header, self.output],
+                     [self.call, {"type": "response_item", "payload": {**self.output["payload"], "output": "Done"}}],
+                     [{"type": "response_item", "payload": {**self.call["payload"], "name": "exec_command"}}, self.output],
+                     [{"type": "response_item", "payload": {**self.call["payload"], "arguments": '{"path":"/other.png"}'}}, self.output]):
+            with self.subTest(shape=[v["payload"]["type"] if v.get("type") == "response_item" else "header" for v in rows]):
+                self.assertFalse(self.read(self.header, *rows).get("callIds"))
+        for delta in ({"id": "other"}, {"cwd": "/other"}, {"forked_from_id": self.sid}):
+            self.assertFalse(self.read({"type": "session_meta", "payload": {**self.header["payload"], **delta}},
+                            self.call, self.output))
+        for delta in ({"ref": "different-ref"}, {"eventDestination": "hub"}, {"cli": "codex"}, {"seq": 6}, {"cliSid": "../elsewhere"}):
+            self.assertFalse(self.read(self.header, self.call, self.output, meta={**self.metadata, **delta}))
+        for delta in ({"ref": "../run-1"}, {"calls": self.request["calls"] * 2}, {"calls": [None]},
+                      {"calls": self.request["calls"] * 1025}):
+            self.assertFalse(self.read(self.header, self.call, self.output, request={**self.request, **delta}))
+
+    def test_refuses_oversize_duplicate_or_linked_rollout_without_repairing_files(self):
+        self.read(self.header, self.call, self.output)
+        def read():
+            return codex_image_history.lookup(str(self.store), self.request)
+        with patch.object(codex_image_history, "_MAX_ARCHIVE", 32):
+            self.assertFalse(read())
+        duplicate = self.receipt.with_name(self.receipt.name.replace("00-00-00", "00-01-00"))
+        duplicate.write_bytes(self.receipt.read_bytes())
+        self.assertFalse(read())
+        duplicate.unlink()
+        if os.name != "nt":
+            target = self.root / "other-session.jsonl"
+            self.receipt.rename(target)
+            self.receipt.symlink_to(target)
+            self.assertFalse(read())
+            self.receipt.unlink()
+            self.receipt.write_text('{"type":"session_meta"')
+            self.assertFalse(read())
 
 
 def tool_update(tool_id, **fields):

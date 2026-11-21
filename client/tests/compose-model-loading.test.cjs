@@ -68,6 +68,84 @@ function fixture() {
   };
 }
 
+test('manual runtime switches carry the exact chosen model across managed Agents and revalidate its provider', async () => {
+  const f = fixture(), catalog = { usable: [
+    { name: 'local:mine', label: 'test', localOnly: true },
+    { name: 'org-model', label: 'test', providerId: 'org' },
+  ] };
+  f.start(); f.requests[0].resolve(catalog); await f.picker.ready();
+  f.choose('org-model');
+  for (const id of ['dsh', 'kimi', 'opencode', 'qwen', 'codex-harness', 'pi']) {
+    const pending = f.picker.prepareRuntimeSwitch({ id, modelMode: 'managed' }, () => true);
+    f.requests.at(-1).resolve(catalog);
+    const model = await pending; assert.equal(model.preservesModel, true);
+    model.apply(); f.agent(id); await f.picker.refresh();
+    assert.equal(await f.picker.ready(), true);
+    assert.equal(f.picker.value().modelName, 'org-model', id);
+  }
+  const changed = f.picker.refresh(true);
+  f.requests.at(-1).resolve({ usable: [{ name: 'org-model', providerId: 'another-org' }] });
+  await changed;
+  assert.equal(await f.picker.ready(), false, 'a name-only route must not use a different provider');
+});
+
+test('an incompatible account runtime, ambiguous provider, and stale switch preserve the original pair', async () => {
+  const f = fixture(), row = { name: 'model', providerId: 'org' };
+  f.start(); f.requests[0].resolve({ usable: [row] }); await f.picker.ready(); f.choose('model');
+  for (const [target, reply, valid] of [
+    [{ id: 'codex', modelMode: 'account' }, { ok: true, models: [{ id: 'model' }] }, true],
+    [{ id: 'qwen', modelMode: 'managed' }, { usable: [row, { ...row, providerId: 'other' }] }, true],
+    [{ id: 'qwen', modelMode: 'managed' }, { usable: [row] }, false],
+  ]) {
+    const pending = f.picker.prepareRuntimeSwitch(target, () => valid);
+    f.requests.at(-1).resolve(reply);
+    assert.equal(await pending, false);
+    assert.equal(f.picker.value().modelName, 'model');
+  }
+});
+
+test('only explicit model choices transfer, with local and image references fenced by location and target mode', async () => {
+  const f = fixture(), local = { name: 'local:mine', label: 'alias', localOnly: true };
+  const catalog = { usable: [local, { name: 'hub', label: 'alias' }],
+    mediaUsable: { image: [{ providerId: 'image', name: 'model' }] } };
+  f.start(); f.requests[0].resolve(catalog); await f.picker.ready();
+  const target = { id: 'new-agent', modelMode: 'managed' };
+  assert.equal(await f.picker.prepareRuntimeSwitch(target, () => true), undefined);
+  assert.equal(f.requests.length, 1, 'automatic defaults do not request a switch catalog');
+  f.choose('image::image::model');
+  let pending = f.picker.prepareRuntimeSwitch(target, () => true); f.requests.at(-1).resolve(catalog);
+  assert.equal(await pending, false);
+  f.choose(local.name);
+  pending = f.picker.prepareRuntimeSwitch(target, () => true); f.requests.at(-1).resolve(catalog);
+  (await pending).apply(); f.agent(target.id); await f.picker.refresh();
+  assert.equal(f.picker.value().modelName, local.name);
+  f.choose('hub');
+  pending = f.picker.prepareRuntimeSwitch({ id: 'pi', modelMode: 'managed' }, () => true);
+  f.requests.at(-1).resolve({ usable: [local], managedCatalogUnavailable: true });
+  assert.equal(await pending, false);
+  assert.equal(f.picker.value().modelName, 'hub');
+  pending = f.picker.prepareRuntimeSwitch({ id: 'pi', modelMode: 'managed' }, () => true);
+  f.location('cloud'); f.requests.at(-1).resolve(catalog);
+  assert.equal(await pending, false);
+});
+
+test('compatibility follows the actual model route and only rejects known incompatible capabilities', async () => {
+  for (const [location, target, detail, expected] of [
+    ['local', 'kimi', { providerKind: 'anthropic' }, false],
+    ['cloud', 'kimi', { providerKind: 'anthropic' }, true],
+    ['cloud', 'codex-harness', { providerKind: 'anthropic' }, false],
+    ['local', 'pi', { capabilityProfile: { streaming: { state: 'unsupported' } } }, false],
+    ['local', 'pi', { capabilityProfile: { streaming: { state: 'unknown' } } }, true],
+  ]) {
+    const f = fixture(), catalog = { usable: [{ name: 'org-model', ...detail }] };
+    f.agent('opencode'); f.location(location); f.start(); f.requests[0].resolve(catalog);
+    await f.picker.ready(); f.choose('org-model');
+    const pending = f.picker.prepareRuntimeSwitch({ id: target, modelMode: 'managed' }, () => true);
+    f.requests.at(-1).resolve(catalog);
+    assert.equal((await pending)?.preservesModel === true, expected, location + '/' + target);
+  }
+});
+
 test('cold composer redraws share the first delayed request and ready waits for that response', async () => {
   const f = fixture(); f.start();
   const original = f.picker.refresh();

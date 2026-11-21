@@ -16,7 +16,7 @@ def validate_reported_usage(usage: dict | None) -> None:
         "completion_tokens", "cache_read_tokens", "cacheRead", "cache_read_input_tokens",
         "cached_input_tokens", "cache_write_tokens", "cacheWrite",
         "cache_creation_input_tokens", "cache_write_input_tokens", "reasoning_tokens",
-        "reasoningTokens", "output_reasoning_tokens", "total_tokens", "total",
+        "reasoningTokens", "output_reasoning_tokens", "reasoning", "total_tokens", "total",
     )
     for name in aliases:
         if name not in data or isinstance(data[name], bool) or data[name] is None:
@@ -124,7 +124,7 @@ def normalize_usage(usage: dict | None) -> dict:
         "cache_write_input_tokens",
     )
     reasoning = _pick(
-        data, "reasoning_tokens", "reasoningTokens", "output_reasoning_tokens",
+        data, "reasoning_tokens", "reasoningTokens", "output_reasoning_tokens", "reasoning",
     )
     includes_cache = bool(data.get("input_includes_cache",
         data.get("inputIncludesCache", "cached_input_tokens" in data)))

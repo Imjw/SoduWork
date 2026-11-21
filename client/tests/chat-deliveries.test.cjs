@@ -109,3 +109,10 @@ test('cloud website preview rewrites runner loopback to the selected host', () =
   assert.equal(deliveries._artifactUrlFor('http://localhost:4173/demo/'), '');
   assert.equal(deliveries._artifactUrlFor('javascript:alert(1)', snapshot), '');
 });
+
+test('a recorded unfinished tool allows file viewing only in a passive history snapshot', () => {
+  const deliveries = helper();
+  const snapshot = { status: 'idle', tools: [{ state: 'running', after: 3 }] };
+  assert.equal(deliveries.isSettled(snapshot), false);
+  assert.equal(deliveries.isSettled({ ...snapshot, localReplica: true, execution: { readOnly: true } }), true);
+});

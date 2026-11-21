@@ -1,6 +1,6 @@
 """Recover native OpenCode finish reasons omitted by its ACP response.
 
-The observer reports identifiers and stop reasons only, over the owned child's
+The observer reports identifiers, settled token counts and stop reasons over the owned child's
 stderr pipe. It neither reads native databases nor persists prompts or secrets.
 """
 from __future__ import annotations
@@ -35,7 +35,8 @@ export default async () => {
       const sid = input.sessionID, user = output.message?.id;
       if (!sid || !order(user)) throw new Error('OpenCode turn identity is unavailable');
       const invocation = (turns.get(sid)?.invocation || 0) + 1;
-      turns.set(sid, { invocation, user, floor: order(user), users: new Set([user]), latest: '', message: '', reason: '' });
+      turns.set(sid, { invocation, user, floor: order(user), users: new Set([user]), model: input.model,
+        reported: new Set(), latest: '', message: '', reason: '' });
       send({ kind: 'begin', sid, user, invocation });
     },
     event: async ({ event }) => {
@@ -46,8 +47,20 @@ export default async () => {
         // Auto-compaction creates native replay/continue users without calling
         // chat.message. Only fresh users observed in this owned session qualify.
         if (info.role === 'user') { turn.users.add(info.id); return; }
-        if (info.role !== 'assistant' || info.summary || !turn.users.has(info.parentID) ||
-            order(info.parentID) >= order(info.id) || order(info.id) < turn.latest) return;
+        if (info.role !== 'assistant' || !turn.users.has(info.parentID) || order(info.parentID) >= order(info.id)) return;
+        const t = info.tokens;
+        if (info.time?.completed && t && turn.model?.modelID && !turn.reported.has(info.id) &&
+            turn.model?.providerID === info.providerID && turn.model?.modelID === info.modelID) {
+          const read = t.cache?.read ?? 0, write = t.cache?.write ?? 0, thought = t.reasoning ?? 0;
+          const total = t.total ?? (t.input + t.output + thought + read + write);
+          if (total > 0) {
+            turn.reported.add(info.id);
+            send({kind: 'usage', sid: info.sessionID, user: turn.user, invocation: turn.invocation,
+              usage: {inputTokens: t.input, outputTokens: t.output, totalTokens: total,
+                cachedReadTokens: read, cachedWriteTokens: write, thoughtTokens: thought}});
+          }
+        }
+        if (info.summary || order(info.id) < turn.latest) return;
         if (order(info.id) === turn.latest && info.id !== turn.message) { turn.invalid = true; return; }
         if (info.id !== turn.message) { turn.message = info.id; turn.latest = order(info.id); turn.reason = ''; }
         if (typeof info.finish === 'string') turn.reason = info.finish;
@@ -76,6 +89,7 @@ class Observer:
         self.invocations = {}
         self.invocation = 0
         self.invalid = False
+        self.on_usage = None
 
     def environment(self, env: dict) -> dict:
         result = dict(env)
@@ -110,6 +124,8 @@ class Observer:
                         self.reason = ""
                     elif not self.user:
                         self.user, self.reason = user, None
+                elif row.get("kind") == "usage" and user == self.user and not self.invalid and self.on_usage:
+                    self.on_usage(row.get("usage"))
                 elif row.get("kind") == "end" and user == self.user:
                     reason = row.get("reason")
                     self.reason = reason if isinstance(reason, str) and len(reason) < 80 else ""

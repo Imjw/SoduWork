@@ -6,7 +6,7 @@ const access = require('../conversation/history-access');
 
 function create({ app, session, accountHistory, BrowserWindow }) {
   async function nativeRow(id) {
-    return session.archivedConversation?.(app, id, { nativeOnly: true, strict: true }) || null;
+    return session.archivedConversation?.(app, id, { nativeOnly: true, strict: true, metadataOnly: true }) || null;
   }
   async function authorize(id, { allowMissing = false } = {}) {
     if (typeof id !== 'string' || !id.trim() || id.length > 512) throw Error('会话标识无效');

@@ -43,8 +43,80 @@ test('shared local reader opens native text without starting any account runtime
   assert.equal(view.snapshot().messages[1].blocks[0].text, 'local answer');
   assert.equal((await view.send('should not execute')).accepted, false);
   f.switch(identity('two'));
-  assert.equal((await f.history.projectRows([f.row])).length, 0);
-  assert.equal(await f.history.open('one'), null);
+  assert.equal((await f.history.projectRows([f.row])).length, 1);
+  assert.equal((await f.history.open('one')).snapshot().messages[0].text, 'saved by Alice');
+  assert.throws(() => view.snapshot(), /切换/, 'A new device view does not revive the old account epoch');
+});
+
+test('legacy automatic account caches stay on disk without entering local history or source resolution', async t => {
+  const f = setup(t), actor = f.identityOf(), account = require('../main/device-auth-request').accountId(actor);
+  const copy = (sourceId, extra = {}) => ({
+    id: 'copy-' + require('node:crypto').createHash('sha256').update(JSON.stringify([actor.hub, account, sourceId])).digest('hex'),
+    cached: true, adapterId: 'account-sync', locationMode: 'account', title: 'Other PC automatic cache',
+    source: { hub: actor.hub, account, id: sourceId }, creator: { hub: actor.hub, account }, ...extra,
+  });
+  const hidden = copy('acct-old', { historyAliasIds: ['old-account-alias'], sourceSessionId: 'old-other-native' });
+  const archived = copy('acct-archived', { archived: true });
+  const manual = copy('acct-manual', { importDigest: 'explicit-import' });
+  const imported = copy('acct-imported', { importedHistory: true });
+  const recovered = copy('native-recovered', { id: 'recovered-local-outbox', archived: true });
+  const nativeEntry = f.session.historyEntry;
+  f.session.historyEntry = (app, id) => id === f.row.id ? nativeEntry(app, id) : { ok: false, notFound: true };
+  f.session.archivedConversation = async (_app, id) => id === f.row.id ? f.row : null;
+  await f.history.projectRows([f.row]);
+  await f.store.register([hidden, archived, manual, imported, recovered]);
+  await f.store.cache(hidden.id, [{ role: 'user', text: 'Retained synthetic account cache' }], { expectedRevision: 0 });
+  const retained = f.store.get(hidden.id), messages = f.store.messages(hidden.id);
+  await f.history.capture({ historyRow: () => ({ id: 'cloud-preserved', cloud: true, locationMode: 'remote' }),
+    snapshot: () => ({ messages: [{ role: 'assistant', text: 'Cloud content' }] }) }, actor);
+  const page = await f.history.page(), ids = page.chats.map(row => row.id);
+  assert.equal(ids.includes(hidden.id), false);
+  assert.ok(ids.includes('one') && ids.includes(manual.id) && ids.includes(imported.id));
+  assert.ok(page.chats.some(row => row.source?.id === 'cloud-preserved'));
+  const catalog = JSON.stringify(page.localCatalog);
+  for (const id of [hidden.id, archived.id, 'acct-old', 'old-account-alias', 'old-other-native']) {
+    assert.equal(catalog.includes(id), false);
+    assert.equal(await f.history.resolve(id), null);
+    assert.equal(await f.history.indexedRow(id), null);
+    assert.equal(await f.history.open(id), null);
+  }
+  await assert.rejects(f.history.read(hidden.id), /不存在/);
+  assert.deepEqual((await f.history.page({ archived: true })).chats.map(row => row.id), [recovered.id]);
+  assert.equal((await f.history.indexedRows(false, 200)).some(row => row.id === hidden.id), false);
+  f.session.history = f.session.archivedHistory = async () => ({ ok: true, chats: [] });
+  assert.equal((await f.history.directory()).items.some(row => row.id === hidden.id || row.id === archived.id), false);
+  assert.equal((await f.history.lifecycleRows()).some(row => row.id === archived.id), false);
+  assert.deepEqual(f.store.get(hidden.id), retained);
+  assert.deepEqual(f.store.messages(hidden.id), messages);
+  await f.history.close();
+  const restartedStore = createStore(path.join(f.root, 'replicas.sqlite'));
+  const restarted = create({ app: f.app, session: f.session, store: restartedStore, identityOf: f.identityOf });
+  try {
+    assert.equal((await restarted.page()).chats.some(row => row.id === hidden.id), false);
+    assert.equal(await restarted.resolve('old-other-native'), null);
+    assert.deepEqual(restartedStore.get(hidden.id), retained);
+    assert.deepEqual(restartedStore.messages(hidden.id), messages);
+  } finally { await restarted.close(); }
+});
+
+test('opening an account projection does not create a new automatic local cache', async t => {
+  const f = setup(t);
+  await f.history.capture({ historyRow: () => ({ id: 'acct-new', accountProjection: true, adapterId: 'account-sync' }),
+    snapshot: () => ({ messages: [{ role: 'user', text: 'Synthetic remote PC content' }] }) }, f.identityOf());
+  assert.deepEqual(f.store.catalog().items, []);
+});
+
+test('retired account cache locators cannot shadow a cold native archive', async t => {
+  const f = setup(t), actor = f.identityOf(), account = require('../main/device-auth-request').accountId(actor);
+  const source = { hub: actor.hub, account, id: 'acct-native-source' };
+  const id = require('../main/conversation/history-cache-policy.cjs').capturedCopyId(source.hub, source.account, source.id);
+  await f.store.register([{ id, cached: true, adapterId: 'account-sync', source,
+    sourceSessionId: f.row.id, creator: { hub: actor.hub, account } }]);
+  assert.equal((await f.history.resolve(f.row.id)).id, f.row.id);
+  assert.deepEqual((await f.history.open(f.row.id)).snapshot().messages.map(row => row.text),
+    ['saved by Alice', 'local answer']);
+  assert.equal(await f.history.resolve(id), null);
+  assert.ok(f.store.get(id), 'the retired cache remains retained on disk');
 });
 
 test('account switching during automatic cloud cache cleanup preserves both accounts data', async t => {
@@ -161,7 +233,7 @@ test('deleted protected receipts remain private across account, Hub and signout 
   await f.history.projectRows([f.row]);
   await f.history.lifecycle(f.row.id, 'delete');
   f.identity = identity('two');
-  await assert.rejects(remote({ action: 'read', id: f.row.id }, async () => {}), /不存在/,
+  await assert.rejects(remote({ action: 'read', id: f.row.id }, async () => {}), /不存在|账号/,
     'ordinary deletion receipts cannot disclose the previous account history');
   const resolve = f.history.resolve.bind(f.history);
   f.identity = owner;

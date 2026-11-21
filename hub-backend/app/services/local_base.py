@@ -605,24 +605,34 @@ def _record_terminal(ref: str, run: dict) -> None:
 
 
 
-def _read_events(ref: str, since: int = 0, limit: int = 400) -> list[dict]:
+def _read_events(ref: str, since: int = 0, limit: int = 400, *, strict: bool = False) -> list[dict]:
     """Read archived activity when it is unavailable in memory after restart or buffer eviction."""
     out: list[dict] = []
     try:
-        with open(os.path.join(_store_dir(ref), "events.jsonl"), encoding="utf-8") as f:
+        with open(os.path.join(_STORE, ref, "events.jsonl"), encoding="utf-8") as f:
             for ln in f:
                 ln = ln.strip()
                 if not ln:
                     continue
                 try:
                     it = json.loads(ln)
-                except Exception:  # noqa: BLE001
+                except ValueError:
+                    if strict:
+                        raise
                     continue
+                if strict and (not isinstance(it, dict) or type(it.get("seq")) is not int or it["seq"] < 1):
+                    raise ValueError("Invalid native history cursor")
                 if int(it.get("seq") or 0) > since:
                     out.append(it)
+                    if len(out) >= limit:
+                        break
     except FileNotFoundError:
+        if strict:
+            raise
         return []
     except Exception:  # noqa: BLE001
+        if strict:
+            raise
         return out[:limit]
     return out[:limit]
 

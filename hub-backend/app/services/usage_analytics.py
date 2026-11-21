@@ -7,6 +7,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import models
+from ..agent_catalog import AGENTS
 from ..timestamps import iso_utc
 
 
@@ -222,6 +223,7 @@ async def overview(
     reliable = quality["reported"] + quality["reconciled"]
     return {
         "days": days, "summary": summary, "trend": trend,
+        "agentNames": {key: row["displayName"] for key, row in AGENTS.items()},
         "bySource": sorted(sources, key=lambda item: item["tokens"], reverse=True),
         "byAgent": sorted(agents, key=lambda item: item["tokens"], reverse=True),
         "users": sorted(people, key=lambda item: item["tokens"], reverse=True),

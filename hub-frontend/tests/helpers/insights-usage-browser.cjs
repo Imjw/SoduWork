@@ -21,9 +21,9 @@ async function checkInsightsUsage({ win, js, waitFor, sleep, screenshot, changeL
     return typography
   }
   fixtures[usageKey] = {
-    ...previousUsage,
-    users: Array.from({ length: 12 }, (_, i) => ({ userId: 'user-' + i, label: 'Member ' + i, sessions: 10, tokens: 10000, costMicrousd: 20000 })),
-    byAgent: Array.from({ length: 30 }, (_, i) => ({ key: 'model-' + i, agent: 'pi', model: 'Model ' + i, provider: 'Fixture Provider', tokens: 10000, costMicrousd: 20000 })),
+    ...previousUsage, summary: { ...previousUsage.summary, tokens: 300000 },
+    users: Array.from({ length: 12 }, (_, i) => ({ userId: 'user-' + i, label: 'Member ' + i, sessions: 10, tokens: 25000, costMicrousd: 20000 })),
+    byAgent: Array.from({ length: 30 }, (_, i) => ({ key: 'model-' + i, agent: ['pi', 'opencode', 'kimi'][i % 3], model: 'Model ' + i, provider: 'Fixture Provider', tokens: 10000, costMicrousd: 20000 })),
   }
   fixtures[insightsKey] = { plugins: Array.from({ length: 30 }, (_, i) => ({
     pluginId: 'plugin-' + i, key: 'plugin-' + i, name: 'Plugin ' + (i + 1), enabled: true,
@@ -33,29 +33,50 @@ async function checkInsightsUsage({ win, js, waitFor, sleep, screenshot, changeL
   try {
     win.setSize(1920, 1080)
     await win.loadURL(origin + '/?screen=usage')
-    await waitFor('document.querySelectorAll(".ugc-agent-list > button").length === 30', 'populated usage ledgers')
+    await waitFor('document.querySelectorAll(".ugc-detail-table tbody tr").length === 10', 'populated usage ledgers')
     await changeLocale('zh-CN')
     const referenceTypography = await fieldTypography('.ugc-filterbar > label:first-child')
     for (const size of [[1920,1080], [3840,1919], [1366,768], [1100,900], [390,844]]) {
       win.setSize(...size); await sleep(180)
       const geometry = await js(`(() => {
-        const panel=document.querySelector('.ugc-agents'), list=panel.querySelector('.ugc-agent-list');
-        const p=panel.getBoundingClientRect(), r=list.getBoundingClientRect(); list.scrollTop=100;
-        return {gap:p.bottom-r.bottom,height:r.height,total:list.scrollHeight,scroll:list.scrollTop,
-          panelHeight:p.height,viewport:[innerWidth,innerHeight],pageWidth:document.documentElement.scrollWidth};
+        const panel=document.querySelector('.ugc-details'), list=panel.querySelector('.ugc-table-wrap');
+        return {rows:list.querySelectorAll('tbody tr').length, visibleHeight:list.clientHeight,
+          contentHeight:list.scrollHeight,pageWidth:document.documentElement.scrollWidth,viewport:innerWidth};
       })()`)
-      record('agent ledger fills its panel and scrolls at ' + size.join('×'), geometry.gap<=2 && geometry.height>150 &&
-        geometry.scroll>0 && geometry.total>geometry.height && geometry.pageWidth<=geometry.viewport[0]+1 &&
-        (size[0]>1100 || geometry.height<=geometry.viewport[1]*.6), geometry)
-      await js(`document.querySelector('.ugc-agent-list').scrollTop=0;document.querySelector('.ugc-agents').scrollIntoView({block:'center'})`)
+      record('ten agent combinations visible without vertical clipping at ' + size.join('×'),
+        geometry.rows===10 && geometry.contentHeight<=geometry.visibleHeight+1 && geometry.pageWidth<=geometry.viewport+1, geometry)
+      await js("document.querySelector('.ugc-details').scrollIntoView({block:'center'})")
       await screenshot('usage-agent-ledger-' + size[0])
     }
-    // A short member page must resize the adjacent ledger without overflowing it.
-    win.setSize(1920,1080); await sleep(180)
-    await js(`document.querySelector('.ugc-members .ugc-pager button:last-child').click()`)
-    await waitFor('document.querySelectorAll(".ugc-member-table tbody tr").length === 4', 'short member page')
-    const lastPage = await js(`(() => {const p=document.querySelector('.ugc-agents'),l=p.querySelector('.ugc-agent-list');return {gap:p.getBoundingClientRect().bottom-l.getBoundingClientRect().bottom,height:l.clientHeight,total:l.scrollHeight}})()`)
-    record('agent ledger follows a shorter member page', lastPage.gap<=2 && lastPage.total>lastPage.height, lastPage)
+    win.setSize(1920,1080)
+    const search = value => js(`(() => { const el=document.querySelector('.ugc-detail-search input');
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(el,${JSON.stringify(value)});
+      el.dispatchEvent(new Event('input',{bubbles:true})); })()`)
+    const setSize = size => js(`(() => {const el=document.querySelector('.ugc-details select'); el.value='${size}';
+      el.dispatchEvent(new Event('change',{bubbles:true}));})()`)
+    await setSize(25)
+    await waitFor('document.querySelectorAll(".ugc-detail-table tbody tr").length === 25', '25 combinations per page')
+    await js("document.querySelector('.ugc-details .ugc-pager button:last-child').click()")
+    await waitFor('document.querySelectorAll(".ugc-detail-table tbody tr").length === 5', 'last five combinations')
+    await setSize(50)
+    await waitFor('document.querySelectorAll(".ugc-detail-table tbody tr").length === 30', 'all combinations')
+    const shareBefore = await js("document.querySelector('.ugc-share-cell em').textContent")
+    await search('mOdEl 29')
+    await waitFor('document.querySelectorAll(".ugc-detail-table tbody tr").length === 1', 'model search ignores case')
+    assert.equal(shareBefore, '3.3%')
+    assert.equal(await js("document.querySelector('.ugc-share-cell em').textContent"), shareBefore)
+    await js("document.querySelector('.ugc-detail-link').click()")
+    await waitFor('document.querySelector(".ugc-detail-link")?.getAttribute("aria-pressed")==="true"', 'agent filter active')
+    await search('No such model')
+    await waitFor('!!document.querySelector(".ugc-details .ugc-empty")', 'empty search results')
+    await js("document.querySelector('#ugc-tab-members').click()")
+    await setSize(10)
+    await js("document.querySelector('.ugc-details .ugc-pager button:last-child').click()")
+    await waitFor('document.querySelectorAll(".ugc-detail-table tbody tr").length === 2', 'remaining two members')
+    await search('Member 11')
+    await waitFor('document.querySelectorAll(".ugc-detail-link").length === 1', 'member search across pages')
+    await js("document.querySelector('.ugc-detail-link').click()")
+    await waitFor('document.querySelector(".ugc-detail-link")?.getAttribute("aria-pressed")==="true"', 'member filter active')
 
     await win.loadURL(origin + '/?screen=insights')
     await waitFor('!!document.querySelector(".oi-plugins .list-pager")', 'plugin usage')

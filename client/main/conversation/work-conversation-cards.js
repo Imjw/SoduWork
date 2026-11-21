@@ -23,6 +23,8 @@ function protectionSummary(record) {
   if (record?.version !== 1 || typeof record.sessionId !== 'string' || typeof record.owner !== 'string' || !Array.isArray(record.cards))
     throw Error('Invalid work card metadata');
   return { version: 1, owner: record.owner,
+    ...(record.protection?.hasPrivateCards || record.cards.some(card => card?.actionId !== 'work.requirement.create')
+      ? { hasPrivateCards: true } : {}),
     hasRequirement: record.protection?.hasRequirement === true ||
       record.cards.some(card => card?.actionId === 'work.requirement.create') };
 }
@@ -50,8 +52,12 @@ function protectionSnapshot(app, file) {
       if (header.version !== 1 || typeof header.sessionId !== 'string' || !header.sessionId ||
           location(app, header.sessionId) !== file || typeof header.owner !== 'string') throw Error('Invalid work card identity');
       legacyOwner = header.owner;
-      if (summary?.version === 1 && summary.owner === header.owner && typeof summary.hasRequirement === 'boolean')
-        return { revision, summary: cacheProtection(file, revision, summary) };
+      if (summary?.version === 1 && summary.owner === header.owner && typeof summary.hasRequirement === 'boolean') {
+        // Older headers identified requirements only. A nonempty legacy form
+        // still contains private work data, even when its attachments are large.
+        const privateCard = !summary.hasRequirement && !prefix.startsWith(',"cards":[]', boundary);
+        return { revision, summary: cacheProtection(file, revision, privateCard ? { ...summary, hasPrivateCards: true } : summary) };
+      }
     }
     if (snapshot.stat.size > BigInt(2 * 1024 * 1024)) return { revision, summary: { unknown: true, owner: legacyOwner } };
     const full = metadataSnapshot.read(app.getPath('userData'), file);
@@ -166,8 +172,8 @@ function restoredRequirementCard(card, captured) {
     return ownerScope === state.ownerScope ? card : { ...card, state: { ...state, ownerScope } };
   } catch (_) { return card; }
 }
-function visibleHistory(app, rows, identity) {
-  return require('./history-access').visible(app, rows, identity).map(row => {
+function visibleHistory(app, rows, identity, desktop = false) {
+  return require('./history-access').visible(app, rows, identity, desktop).map(row => {
     // Draft selection is separate from the Pi archive format and execution
     // provenance. Read only the bounded header, never card attachments.
     let selected = '';
@@ -289,16 +295,16 @@ function create({ app, identityOf, session, accountHistory, sharedHistory, newCw
     const now = await auth();
     if (captured.owner !== now.owner || captured.connection !== now.connection) throw Error('账号或服务已切换，请在当前会话重试');
   }
-  async function resolve(id, captured, { allowMissing = false } = {}) {
+  async function nativeRow(id, captured, lookup) {
     await guard(captured);
     const live = session.findBySessionId?.(id);
     const row = live ? live.historyRow?.() || { id, adapterId: live.adapterId }
-      : await session.archivedConversation(app, id);
-    if (!row) {
-      if (allowMissing) return null;
-      throw Error('这条会话已经不存在，工作表单未保存');
-    }
+      : await session.archivedConversation(app, id, lookup);
     await guard(captured);
+    return row;
+  }
+  function ownedRow(id, captured, row) {
+    if (!row) throw Error('这条会话已经不存在，工作表单未保存');
     const access = require('./history-access');
     access.assertReadable(app, id, access.actor(app, captured.identity), { ...row, id });
     if (row.cached === true) throw Error('这条会话是只读历史副本，不能保存工作表单');
@@ -311,6 +317,9 @@ function create({ app, identityOf, session, accountHistory, sharedHistory, newCw
     const linked = require('./requirement-context').read(app, id);
     if (linked && !scopeMatches(linked.owner, captured.identity, accountCandidates(app))) throw Error('这条需求会话属于另一个账号');
     return { ...row, id };
+  }
+  async function resolve(id, captured) {
+    return ownedRow(id, captured, await nativeRow(id, captured));
   }
   function owner(record, captured) {
     if (record && !scopeMatches(record.owner, captured.identity, accountCandidates(app))) throw Error('工作表单属于另一个账号，请切回原账号');
@@ -421,17 +430,54 @@ function create({ app, identityOf, session, accountHistory, sharedHistory, newCw
       const captured = await auth();
       // Cached local transcripts have no native work-card archive. Their scoped
       // index authorizes passive preparation only, never card writes or execution.
-      const cached = sharedHistory?.store
-        ? await sharedHistory.store.get(id) : await session.indexedHistoryRow?.(id);
+      const lookupIndex = key => sharedHistory?.store ? sharedHistory.store.get(key) : session.indexedHistoryRow?.(key);
+      const emptyCards = sessionId => ({ ok: true, sessionId, cards: [], workOnly: false, draftSelection: null, draftSelectionRevision: 0 });
+      const cached = await lookupIndex(id);
       await guard(captured);
-      if (cached?.cached === true && require('./shared-history.cjs').isLocalIdentity(cached, id)) {
-        if (cached.deleted) throw Error('这条会话已经不存在，工作表单未保存');
+      const { isLocalIdentity } = require('./shared-history.cjs');
+      const indexed = isLocalIdentity(cached, id) ? cached : null;
+      if (indexed?.deleted) throw Error('这条会话已经不存在，工作表单未保存');
+      if (indexed?.cached === true) {
+        if (require('./history-cache-policy.cjs').automaticAccountCache(cached))
+          throw Error('这条会话已经不存在，工作表单未保存');
         const access = require('./history-access');
         access.assertReadable(app, cached.id, access.actor(app, captured.identity), cached);
         return { ok: true, sessionId: cached.id, cards: [], presence: publicPresence({ ...cached, workOnly: false }),
           workOnly: false, draftSelection: null, draftSelectionRevision: 0 };
       }
-      let row = await resolve(id, captured, { allowMissing: true });
+      if (indexed) id = sessionId(indexed.id);
+      const retained = indexed && (indexed.deviceHistory || indexed.deviceTransferId || indexed.historyContentState === 'missing');
+      let native;
+      try {
+        native = await nativeRow(id, captured, retained ? { nativeOnly: true, metadataOnly: true } : undefined);
+      } catch (error) {
+        if (error.historyAccessFailure || error.code !== 'RUNNER_HISTORY_UNAVAILABLE' || !indexed?.deviceHistory || !indexed.adapterId) throw error;
+        // A stopped Runner can mask a separate Pi index error. Only a verified
+        // retained ordinary chat may skip forms; the transcript independently
+        // checks archive ownership and tool receipts before displaying or continuing.
+        const pi = await session.historyEntry?.(app, id, { strict: true });
+        const requested = sessionId(rawId), latest = await lookupIndex(requested);
+        await guard(captured);
+        if ((!pi?.ok && pi?.notFound !== true) || (pi?.ok && (pi.entry?.id !== id || indexed.adapterId === 'pi')) || !isLocalIdentity(latest, requested) ||
+            latest.id !== id || latest.deleted || latest.cached || !latest.deviceHistory || latest.adapterId !== indexed.adapterId) throw error;
+        const access = require('./history-access');
+        const nativePi = pi.ok ? pi.entry : null;
+        if (!access.usesDeviceChatContext(app, { chatId: id }, latest, nativePi)) throw error;
+        const evidence = require('./history-evidence.cjs').mergeNativeEvidence(latest, nativePi);
+        access.assertDeviceReadable(app, id, access.actor(app, captured.identity), evidence);
+        return emptyCards(id);
+      }
+      let row = native || (retained ? indexed : null);
+      const evidence = native && indexed ? require('./history-evidence.cjs').mergeNativeEvidence(indexed, native) : row;
+      if (evidence && !evidence.workOnly && !native?.workOnly && isLocalIdentity(evidence, id)) {
+        const access = require('./history-access');
+        if (access.assertDeviceReadable(app, evidence.id, access.actor(app, captured.identity), evidence)?.sharedOnDevice) {
+          // The desktop opens the transcript separately. Never project another
+          // account's draft choices, form attachments or editable presence.
+          return emptyCards(evidence.id);
+        }
+      }
+      if (row) row = ownedRow(id, captured, row);
       if (accountHistory && (!row || row.accountProjection || row.adapterId === 'account-sync')) {
         // Card restoration runs before Agent opening. Resolve a trusted account
         // alias here as well, without starting a runtime or trusting renderer flags.

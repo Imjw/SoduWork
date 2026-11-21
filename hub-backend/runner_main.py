@@ -770,6 +770,14 @@ class Runner:
             from app.services import access_policy
             item["accessControl"] = access_policy.capability(key)
             return {"ok": True, "data": item}
+        if op == "runtime.history.imageReceipts":
+            from app.services import codex_image_history, local_base
+            receipts = await runner_local_rpc.to_thread(codex_image_history.lookup, local_base._STORE, message)
+            return {"ok": True, "data": receipts}
+        if op == "runtime.history.qwenCancelledWrites":
+            from app.services import local_base, qwen_tool_history
+            receipts = await runner_local_rpc.to_thread(qwen_tool_history.lookup, local_base._STORE, message)
+            return {"ok": True, "data": receipts}
         if op == "runtime.sessions":
             from app.services import ai_local
             return {"ok": True, "data": await runner_local_rpc.to_thread(
@@ -1866,7 +1874,7 @@ class Runner:
                     queued = runner_admission.with_native_history(queued, native)
                 return {"ok": True, "data": remote_snapshot(queued, ref)}
             data = await runner_local_rpc.to_thread(
-                ai_local.session_sync, {}, ref,
+                ai_local.session_sync, {"historyRead": m.get("_localParent") is True and m.get("historyRead") is True}, ref,
                 max(0, int(m.get("since") or 0)),
                 min(1000, max(1, int(m.get("limit") or 400))))
             from app.services import local_stream

@@ -31,9 +31,9 @@ async function mountUsage() {
       control.props.onChange({ target: { value } })
       render()
     },
-    selectLedger(name, value) {
+    selectLedger(name, value, handler = 'onSelect') {
       const ledger = nodes((node) => node.type === name || node.type?.name === name)[0]
-      ledger.props.onSelect(value)
+      ledger.props[handler](value)
       render()
     },
   }
@@ -89,8 +89,8 @@ test('historical runtime ledgers keep filters and requests cannot update after u
   page.nodes(() => false)
   page.calls[0].resolve(result(10)); await page.flush()
   page.change('统计周期', '90')
-  page.selectLedger('MemberLedger', 'member-2')
-  page.selectLedger('AgentLedger', 'claude-code')
+  page.selectLedger('UsageDetails', 'member-2', 'onMember')
+  page.selectLedger('UsageDetails', 'claude-code', 'onAgent')
   page.selectLedger('SceneLedger', 'automation')
   assert.deepEqual(page.calls.at(-1).filters, { days: 90, userId: 'member-2', source: 'automation', agent: 'claude-code' })
   assert.equal(shownTokens(page), 10, 'the previous report stays available during loading')
@@ -105,4 +105,6 @@ test('usage labels preserve retired runtime history without renaming its identif
   assert.equal(format.agentName('claude-code'), 'Claude Code')
   assert.equal(format.agentName('harness2'), 'Google Harness²')
   assert.equal(format.agentName('codex'), 'Codex')
+  assert.equal(format.agentName('dsh', { dsh: 'DeepSeek Harness' }), 'DeepSeek Harness')
+  assert.equal(format.agentName('new-agent', { 'new-agent': 'New Agent' }), 'New Agent')
 })

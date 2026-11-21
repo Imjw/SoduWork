@@ -448,6 +448,33 @@ function setupPickerRender(getTasksSnapshot) {
   return { ...harness, controller, views, transcriptWrites: () => transcriptWrites };
 }
 
+test('read-only history keeps the draft in a visible disabled composer and releases it on navigation', () => {
+  const { ctx, renderer } = setupRender();
+  const el = ctx._mount(), query = el.querySelector.bind(el);
+  const input = { value: 'Unsent draft', placeholder: '接着说…', disabled: false, hidden: false };
+  el.querySelector = selector => selector === '#nchatInput' ? input : query(selector);
+  ctx._snap = { status: 'idle', messages: [], tools: [], localReplica: true,
+    execution: { readOnly: true, canContinueOnDevice: false } };
+  renderer._render();
+  assert.equal(input.disabled, true);
+  assert.equal(input.hidden, false);
+  assert.equal(input.placeholder, '这条历史当前仅可查看');
+  assert.equal(input.value, 'Unsent draft');
+
+  ctx._snap.execution.canContinueOnDevice = true;
+  renderer._render();
+  assert.equal(input.disabled, false);
+  assert.equal(input.placeholder, '接着说…');
+  assert.equal(input.value, 'Unsent draft');
+
+  ctx._snap.execution = {};
+  renderer._render();
+  assert.equal(input.disabled, true, 'Older replicas without a continuation grant are view-only');
+  ctx._snap = { ...ctx._snap, localReplica: false, accessPolicy: { mode: 'readonly' } };
+  renderer._render();
+  assert.equal(input.disabled, false, 'A read-only tool permission still allows chatting');
+});
+
 test('passive local history renders every saved assistant answer across reopen and stream pages', async () => {
   const { create } = require('../main/conversation/local-history-view.cjs');
   for (const format of ['messages', 'events']) {

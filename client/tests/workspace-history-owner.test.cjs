@@ -17,7 +17,7 @@ function fixture(user = 'user-a', options = {}) {
       onEventBatch(fn) { const sub = { fn, closed: false }; subscriptions.push(sub); return () => { sub.closed = true; }; },
     } },
   };
-  const sandbox = vm.createContext({ window, URL });
+  const sandbox = vm.createContext({ window, URL, document: options.document });
   for (const name of ['workspace-chat-history', 'workspace-sidebar-state', 'workspace-chat-list']) {
     let source = fs.readFileSync(path.join(__dirname, '../components/workspace', name + '.js'), 'utf8');
     if (options.realHistory && name === 'workspace-chat-list') {
@@ -375,6 +375,87 @@ test('local saved history paints before a hung account request and restores only
   assert.deepEqual(Array.from(f.ctx.chatItems.filter(row => row.id.startsWith('saved-')), row => row.id), f.rows.map(row => row.id));
   assert.equal(f.ctx.chatItems.some(row => row.id === 'cloud-b' || row.id === 'old-cloud-a'), false);
   assert.equal(f.calls.filter(call => call.refresh).length, 3, 'Each new account epoch gets one coalesced native refresh');
+});
+
+test('each account recovers its authorized private inventory through A to B to A to B while cloud requests remain pending', async () => {
+  const f = localFixture('user-a', 4);
+  for (const row of f.rows) row.taskId = 'private-task-a';
+  const ownedB = [{ id: 'owned-b', title: 'B private task history', taskId: 'private-task-b', at: 20 }];
+  void f.api.refreshConversationHistory();
+  await f.api.refreshLocalHistory(); await tick();
+  assert.deepEqual(Array.from(f.ctx.chatItems, row => row.id), f.rows.map(row => row.id));
+  for (const [owner, workspace, rows] of [
+    ['user-b', 'profile-b', ownedB], ['user-a', 'profile-one', f.rows], ['user-b', 'profile-b', ownedB],
+  ]) {
+    f.visible(rows); f.profile(workspace); await f.switch(owner);
+    await f.api.refreshLocalHistory(); await tick();
+    assert.deepEqual(Array.from(f.ctx.chatItems, row => row.id), rows.map(row => row.id));
+  }
+  for (const resolve of f.remote) resolve({ ok: true, chats: [] });
+  await tick();
+  assert.deepEqual(Array.from(f.ctx.chatItems, row => row.id), ['owned-b']);
+});
+
+test('same-PC ordinary history reloads from each current account catalog and opens its original ID without leaking private rows', async () => {
+  class Element {
+    constructor() { this.children = []; this.dataset = {}; this.handlers = {}; this.style = {}; }
+    append(...items) { this.children.push(...items); }
+    appendChild(item) { this.append(item); return item; }
+    addEventListener(name, fn) { this.handlers[name] = fn; }
+    setAttribute() {}
+    set textContent(value) { this.text = value; }
+    get textContent() { return this.text ?? this.children.map(item => item.textContent).join(''); }
+    querySelector(selector) {
+      const all = this.children.flatMap(item => [item, ...item.descendants()]);
+      return all.find(item => String(item.className || '').split(' ').includes(selector.slice(1))) || null;
+    }
+    descendants() { return this.children.flatMap(item => [item, ...item.descendants()]); }
+  }
+  let owner = 'user-a', gate = null;
+  const remote = [], opens = [];
+  const ordinary = { id: 'ordinary-on-this-pc', title: 'Shared local conversation', adapterId: 'pi', at: 100 };
+  const localRows = () => [ordinary,
+    { id: 'task-' + owner, title: 'Private task ' + owner, taskId: 'requirement-' + owner, at: 90 },
+    { id: 'cache-' + owner, title: 'Private cloud download ' + owner, cached: true, localReplica: true, at: 80 }];
+  const page = () => { const rows = localRows(); return { ok: true, chats: rows, next: null,
+    localCatalog: { workspace: 'local-view-' + owner, revision: 1,
+      items: rows.map(row => ({ id: row.id, historyAliasIds: [] })) } }; };
+  const f = fixture(owner, { local: true, realHistory: true, document: { createElement: () => new Element() },
+    history: options => options.source === 'local' ? (gate || Promise.resolve(page()))
+      : owner === 'user-b' ? new Promise(resolve => remote.push(resolve))
+        : Promise.resolve({ ok: true, chats: [{ id: 'cloud-user-a', title: 'A cloud', cloud: true }] }) });
+  const ids = () => new Set(Array.from(f.ctx.paintedRows, row => row.id));
+  const first = f.api.refreshConversationHistory();
+  await f.api.refreshLocalHistory(); await tick();
+  await first;
+  assert.deepEqual(ids(), new Set([ordinary.id, 'task-user-a', 'cache-user-a', 'cloud-user-a']));
+  let release;
+  gate = new Promise(resolve => { release = resolve; }); owner = 'user-b';
+  await f.switch(owner);
+  assert.equal(f.ctx.chatItems.length, 0, 'The previous account catalog cannot authorize the new view while its own read is pending');
+  assert.equal(f.window.WorkspaceSidebarState.localHistoryId(ordinary.id), '');
+  gate = null; release(page()); await f.api.refreshLocalHistory(); await tick();
+  assert.deepEqual(ids(), new Set([ordinary.id, 'task-user-b', 'cache-user-b']));
+  assert.equal(f.window.WorkspaceSidebarState.localHistoryRevision('local-view-user-b'), 1);
+  assert.equal(f.window.WorkspaceSidebarState.localHistoryId('task-user-a'), '');
+  assert.equal(remote.length, 1, 'Local history does not await the new account cloud directory');
+  f.ctx.icon = () => ''; f.ctx.wsT = (_key, fallback) => fallback;
+  f.ctx.setActiveChat = id => { f.ctx.activeChatId = id; };
+  f.window.WorkspaceHost = { open: (...args) => opens.push(args) };
+  const row = f.api._newChatRow(); f.api._paintChatRow(row, f.ctx.paintedRows.find(row => row.id === ordinary.id), false);
+  row.querySelector('.ws-chat').handlers.click({ stopPropagation() {} });
+  assert.equal(opens[0][0], 'create');
+  assert.deepEqual(JSON.parse(JSON.stringify(opens[0][1])), {
+    tab: 'chat', chatId: ordinary.id, chatTitle: ordinary.title, taskSession: false,
+  });
+  assert.equal(f.ctx.activeChatId, ordinary.id);
+  owner = 'user-a'; await f.switch(owner); await f.api.refreshLocalHistory();
+  await f.ctx.historyLoad;
+  remote[0]({ ok: true, chats: [{ id: 'cloud-user-b-late', title: 'Late B cloud', cloud: true }] });
+  await tick();
+  assert.deepEqual(ids(), new Set([ordinary.id, 'task-user-a', 'cache-user-a', 'cloud-user-a']));
+  assert.equal(f.window.WorkspaceSidebarState.localHistoryRevision('local-view-user-a'), 1);
+  assert.equal(f.window.WorkspaceSidebarState.localHistoryId('task-user-b'), '');
 });
 
 test('an offline shell can load main-authorized local pages without a remote read and resets them on account change', async () => {

@@ -103,6 +103,26 @@ test('private parsing requests generated fields in the current UI language', asy
   assert.match(instructions[2], /Output language: Simplified Chinese\./);
 });
 
+test('the creation form never promotes the submitted task or its references to system instructions', async () => {
+  const requests = [];
+  const api = rendererParser(async request => {
+    requests.push(request);
+    return { ok: true, text: '{"title":"Website draft"}' };
+  });
+  const text = 'Build a website.', change = 'Use the new style.', attachment = 'Private reference material.';
+  await api.parseTaskText(text, 'local:test', [{name:'source', mode:'text', text:attachment}], {instruction:text});
+  await api.parseTaskText(text.repeat(5000), 'local:test', [], {instruction:change});
+  for (const request of requests) {
+    assert.doesNotMatch(request.instructions, /Build a website|Use the new style|Private reference material/);
+    assert.match(request.input, /Build a website/);
+    assert.ok(request.input.length <= 16000);
+  }
+  assert.equal(requests[0].instructions, requests[1].instructions);
+  assert.equal(requests[0].input.split(text).length, 2);
+  assert.ok(requests[0].input.includes(attachment));
+  assert.ok(requests[1].input.includes(change));
+});
+
 test('the default local parser resolves encrypted configuration and calls a real keyless provider', async t => {
   const f = await providerFixture(t, () => completion('{"title":"Local requirement","note":"Keep the full instruction"}'));
   const result = await f.parser({ model: f.ref, input: '原始需求', instructions: '只返回 JSON', requestId: 'real-local-parser' });
@@ -229,6 +249,60 @@ test('invalid structured output remains a format error and cannot fabricate an e
     assert.equal(result.title, undefined);
   }
   assert.equal(f.requests.length, 3);
+});
+
+test('a private draft uses the final object after inline reasoning and preserves JSON literals', async t => {
+  const draft = { title: 'Final draft', note: 'Keep `{example}` and </think> as typed.' };
+  const answer = JSON.stringify(draft);
+  const outputs = [
+    '<think>Example: {"title":"private example"}</think>\n```json\n' + answer + '\n```',
+    [{ type: 'text', text: answer.slice(0, 15) }, { type: 'text', text: answer.slice(15) }],
+    'Here is the result:\n' + answer + '\nEnd of the draft.',
+  ];
+  const f = await providerFixture(t, () => completion(outputs.shift()));
+  const api = rendererParser(f.parser);
+  for (let index = 0; index < 3; index++) {
+    const result = await api.parseTaskText('Make a website.', f.ref);
+    assert.equal(result.title, draft.title);
+    assert.equal(result.note, draft.note);
+  }
+  assert.equal(f.requests.length, 3);
+});
+
+test('private drafts reject ambiguous, incomplete, and reasoning-only envelopes', async t => {
+  const example = '{"title":"Never publish this example"}';
+  const cases = [
+    completion('<think>' + example + '</think>'),
+    completion('<think>' + example),
+    completion('[' + example + ']'), completion('[' + example),
+    completion('```json\n' + example), completion(example + '\n' + example), completion(example + ', "note":'),
+    completion([{ type: 'text', text: example }, { type: 'refusal', refusal: 'private refusal' }]),
+    completion(example, 'content_filter'), completion(example, 'tool_calls'), completion(example, null),
+    {body: {choices: [{message: {content: example, tool_calls: [{id:'tool'}]}, finish_reason:'stop'}]}},
+    {body: {choices: [{message: {content: example, refusal:'declined'}, finish_reason:'stop'}]}},
+  ];
+  const f = await providerFixture(t, () => cases.shift());
+  const api = rendererParser(f.parser);
+  const count = cases.length;
+  for (let index = 0; index < count; index++) {
+    const result = await api.parseTaskText('Keep my draft.', f.ref);
+    assert.equal(result.title, undefined);
+    assert.match(result._parseError, /原文已保留/);
+    assert.doesNotMatch(result._parseError, /Never publish|private refusal|declined/);
+  }
+  assert.equal(f.requests.length, count);
+});
+
+test('alternate provider length markers never turn a partial object into a saved draft', async t => {
+  const reasons = ['max_tokens', 'max_output_tokens'];
+  const f = await providerFixture(t, () => completion('{"title":"Unfinished"}', reasons.shift()));
+  const api = rendererParser(f.parser);
+  for (let index = 0; index < 2; index++) {
+    const result = await api.parseTaskText('Keep the original.', f.ref);
+    assert.match(result._parseError, /长度上限.*原文已保留/);
+    assert.equal(result.title, undefined);
+  }
+  assert.equal(f.requests.length, 2);
 });
 
 test('private provider failures expose a safe cause without response metadata or platform quota hints', async t => {

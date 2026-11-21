@@ -23,6 +23,7 @@ from ..db import get_session
 from ..config import get_settings
 from ..deps import current_ai_client, current_model_client, enforce_client_quota
 from ..models import Client
+from ..services.proxy_usage_shadow import ProxyObservation
 from ..services import (
     device_auth,
     local_context_policy,
@@ -144,7 +145,7 @@ def _err(status: int, msg: str, upstream: str = "") -> JSONResponse:
     return JSONResponse(status_code=status, content=body)
 
 
-async def _stream_upstream_response(resp, outcome=None):
+async def _stream_upstream_response(resp, outcome=None, observation=None):
     """Forward bytes unchanged; never pretend a truncated stream completed."""
     iterator = resp.chunks().__aiter__()
     pending = None
@@ -162,6 +163,8 @@ async def _stream_upstream_response(resp, outcome=None):
                 break
             pending = None
             if chunk:
+                if observation is not None:
+                    observation.feed(chunk)
                 tail = (tail + chunk)[-4:]
                 # Never insert a comment into a partially transmitted SSE event.
                 boundary = tail.endswith(b"\n\n") or tail.endswith(b"\r\n\r\n")
@@ -275,7 +278,7 @@ def _fmt_observation(obs: dict) -> str:
                     for key in ("prompt", "completion", "total", "cached", "reasoning"))
 
 
-def _usage_passthrough(raw: bytes, *, model: str, provider: str, mode: str) -> bytes:
+def _usage_passthrough(raw: bytes, *, model: str, provider: str, mode: str, observation=None) -> bytes:
     """Normalize supported token-detail aliases, preserving unknown values.
 
     Do not synthesize zero counts when the upstream does not report details.
@@ -286,9 +289,13 @@ def _usage_passthrough(raw: bytes, *, model: str, provider: str, mode: str) -> b
     except Exception:  # noqa: BLE001  Preserve non-JSON upstream responses, including error pages.
         return raw
     if not isinstance(obj, dict) or not isinstance(obj.get("usage"), dict):
+        if observation is not None:
+            observation.observe(obj)
         return raw
     usage = obj["usage"]
     fixed = _standardize_usage_object(usage)
+    if observation is not None:
+        observation.observe({**obj, "usage": fixed if fixed is not None else usage})
     if fixed is not None:
         obj["usage"] = fixed
         usage = fixed
@@ -309,7 +316,7 @@ class _OwnedStreamingResponse(StreamingResponse):
             await self.body_iterator.aclose()
 
 
-async def _open_then_stream(request: Request, open_call, *, responses: bool = False) -> StreamingResponse:
+async def _open_then_stream(request: Request, open_call, *, responses: bool = False, observation=None) -> StreamingResponse:
     """Emit SSE heartbeats while opening upstream, then forward its body unchanged. Disconnects
     cancel opening; cleanup releases sockets and capacity leases idempotently. Opening failures
     become in-stream errors under HTTP 200. Record opening timings in logs because
@@ -337,7 +344,7 @@ async def _open_then_stream(request: Request, open_call, *, responses: bool = Fa
                 opened.timing["mode"] = "stream"
             log.info("[ai-proxy] upstream open ok openMs=%.1f",
                      (time.perf_counter() - started) * 1000)
-            upstream = _stream_upstream_response(opened, holder)
+            upstream = _stream_upstream_response(opened, holder, observation)
             async for chunk in upstream:
                 yield chunk
             completed = True
@@ -396,6 +403,11 @@ async def _open_then_stream(request: Request, open_call, *, responses: bool = Fa
                     except asyncio.CancelledError:
                         cancelled = True
             cleanup.result()
+            if observation is not None:
+                if completed:
+                    holder["observationOutcome"] = outcome
+                else:
+                    await observation.save(outcome)
             if cancelled:
                 raise asyncio.CancelledError
 
@@ -403,12 +415,20 @@ async def _open_then_stream(request: Request, open_call, *, responses: bool = Fa
         resp = holder.get("resp")
         if resp is not None:
             await resp.aclose()
+        if observation is not None and "observationOutcome" in holder:
+            await observation.save(holder.pop("observationOutcome"))
 
     return _OwnedStreamingResponse(gen(), media_type="text/event-stream",
                              background=BackgroundTask(_bg),
                              headers={"Cache-Control": "no-cache",
                                       "X-Accel-Buffering": "no",       # Disable nginx buffering.
                                       "Connection": "keep-alive"})
+
+
+def _observed_response(response, observation, outcome):
+    if observation is not None:
+        response.background = BackgroundTask(observation.save, outcome)
+    return response
 
 
 def _proxy_error(exc, *, responses=False):
@@ -812,27 +832,29 @@ async def chat_completions(
         finally:
             await _release_catalog_connection(session)
 
+    observation = ProxyObservation.start(client, conf, "chat")
     await _release_catalog_connection(session)
     if stream:
         # Send SSE heartbeats while awaiting upstream headers; see _open_then_stream.
         return await _open_then_stream(request, lambda: model_transport.until_disconnect(
-            request, multimodal_proxy.open_request(conf, "/chat/completions", payload, _observe)))
+            request, multimodal_proxy.open_request(conf, "/chat/completions", payload, _observe)),
+            observation=observation)
 
     try:
         resp = await model_transport.until_disconnect(request,
             multimodal_proxy.open_request(conf, "/chat/completions", payload, _observe))
     except model_errors.UpstreamError as e:
-        return _proxy_error(e)
+        return _observed_response(_proxy_error(e), observation, "failed")
     if getattr(resp, "timing", None):
         request.state.model_timing = resp.timing
         resp.timing["mode"] = "complete"
     try:
         raw = await model_transport.until_disconnect(request, resp.read())
         raw = _usage_passthrough(raw, model=conf["model"],
-                                 provider=conf.get("provider") or "", mode="complete")
-        return Response(content=raw, media_type="application/json")
+                                 provider=conf.get("provider") or "", mode="complete", observation=observation)
+        return _observed_response(Response(content=raw, media_type="application/json"), observation, "completed")
     except model_errors.UpstreamError as exc:
-        return _proxy_error(exc)
+        return _observed_response(_proxy_error(exc), observation, "failed")
 
 
 @router.post("/v1/responses")
@@ -876,25 +898,26 @@ async def responses(
     stream = bool(body.get("stream"))
     log.info("[ai-proxy:responses] %s → %s（%s，%s）", client.id, conf["model"],
              conf.get("provider") or "", "流式" if stream else "整包")
+    observation = ProxyObservation.start(client, conf, "responses")
     await _release_catalog_connection(session)
     if stream:
         # Keep ingress active with SSE heartbeats during long upstream prefill.
         return await _open_then_stream(request, lambda: model_transport.until_disconnect(
             request, multimodal_proxy.open_request(conf, "/responses", payload, _observe)),
-            responses=True)
+            responses=True, observation=observation)
 
     try:
         resp = await model_transport.until_disconnect(request,
             multimodal_proxy.open_request(conf, "/responses", payload, _observe))
     except model_errors.UpstreamError as exc:
-        return _proxy_error(exc, responses=True)
+        return _observed_response(_proxy_error(exc, responses=True), observation, "failed")
     if getattr(resp, "timing", None):
         request.state.model_timing = resp.timing
         resp.timing["mode"] = "complete"
     try:
         raw = await model_transport.until_disconnect(request, resp.read())
         raw = _usage_passthrough(raw, model=conf["model"],
-                                 provider=conf.get("provider") or "", mode="responses")
-        return Response(content=raw, media_type="application/json")
+                                 provider=conf.get("provider") or "", mode="responses", observation=observation)
+        return _observed_response(Response(content=raw, media_type="application/json"), observation, "completed")
     except model_errors.UpstreamError as exc:
-        return _proxy_error(exc)
+        return _observed_response(_proxy_error(exc), observation, "failed")

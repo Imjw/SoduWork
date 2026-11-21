@@ -206,11 +206,14 @@ function install({ app, ipcMain, session, identityOf, capabilityGrantsOf, _skill
   });
 
   /* Conversation history for sidebar navigation. */
-  ipcMain.handle('pi-session-history', async (_event, options) => {
+  ipcMain.handle('pi-session-history', async (event, options) => {
     try {
       const access = require('../conversation/history-access');
       const local = options?.source === 'local';
       const account = options?.source === 'account';
+      const { isTrusted } = require('../access-control/preferences');
+      const desktop = isTrusted(event);
+      if (local && !desktop) throw Error('本机历史只能从 SoduWork 桌面窗口读取');
       const profile = app.getPath('userData');
       const captured = access.actor(app);
       if (!captured.readScope) throw Error('请先登录 SoduWork 后查看会话');
@@ -221,8 +224,12 @@ function install({ app, ipcMain, session, identityOf, capabilityGrantsOf, _skill
       }
       access.assertCurrent(app, captured);
       const identity = require('../conversation/requirement-context').cachedIdentity(app);
-      const rows = require('../conversation/work-conversation-cards').visibleHistory(app, result.chats || [], identity);
-      return { ...result, chats: rows.map(row => conversationTitles.decorate(app,
+      if (desktop && !isTrusted(event)) throw Error('页面已变化，请重新读取会话');
+      const rows = require('../conversation/work-conversation-cards').visibleHistory(app, result.chats || [], identity, desktop && !account);
+      // Device tombstones also carry native aliases. Only desktop navigation
+      // consumes them; other clients keep their account lifecycle receipts.
+      const lifecycle = !desktop && result.lifecycle ? result.lifecycle.filter(row => !row.localReplica) : result.lifecycle;
+      return { ...result, ...(lifecycle ? { lifecycle } : {}), chats: rows.map(row => conversationTitles.decorate(app,
         require('../conversation/requirement-context').decorate(app, row, identity))) };
     }
     catch (e) { return { ok: false, reason: String((e && e.message) || e), chats: [] }; }

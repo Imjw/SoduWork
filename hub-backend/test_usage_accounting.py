@@ -169,6 +169,16 @@ class UsageAccountingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['costQuality']['unknown'], 1)
         self.assertEqual(result['costQuality']['otherCurrency'], 1)
 
+    async def test_reasoning_alias_rejects_out_of_range_client_usage(self):
+        for count in (-1, 1_000_000_001, float('inf')):
+            with self.subTest(count=count), self.assertRaisesRegex(ValueError, 'usage.reasoning'):
+                await ledger.from_client(self.session, self.client, {
+                    'sourceId': 'reasoning-alias', 'agent': 'opencode', 'model': 'fixture',
+                    'usage': {'reasoning': count}})
+        self.assertEqual(await self.session.scalar(select(func.count(models.AIUsageDaily.id))), 0)
+        ledger.validate_reported_usage({'reasoning': 1_000_000_000})
+        self.assertEqual(ledger.normalize_usage({'reasoning': 7})['total_tokens'], 7)
+
     def test_exact_integer_counters_and_decimal_half_up_costs(self):
         self.assertEqual(ledger.normalize_usage({'total': 9007199254740993})['total_tokens'], 9007199254740993)
         self.assertEqual(ledger.normalize_usage({'input': 2, 'cost': 0.0000015})['cost_microusd'], 2)

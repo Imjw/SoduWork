@@ -21,6 +21,9 @@
 .nmedia-retry[hidden]{display:none}
 .noutput-image.nmedia-local,.noutput-video.nmedia-local{padding:0;border:0;border-radius:0;box-shadow:none;background:transparent}
 .noutput-image.nmedia-local{min-width:0}
+.noutput-gallery .noutput-image{margin:0}
+.noutput-gallery.nmedia-grid .noutput-image{width:100%}
+.noutput-image-missing{align-self:center;color:var(--ink-3);font-size:13px;overflow-wrap:anywhere}
 .noutput-video.nmedia-local{width:fit-content;max-width:min(360px,100%)}
 .ncw-remote-media{position:relative}
 .ncw-remote-media img{border-radius:6px}

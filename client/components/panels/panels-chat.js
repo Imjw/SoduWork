@@ -344,7 +344,7 @@
     // or a file journal, then retry only twice within the same render scope.
     const localOutputMayBeLate = Boolean(_snap?.fileChanges || _snap?.execution?.fileChanges || currentTurnTools);
     try {
-      const taskIds = [..._collabTasks.keys(), ...((_snap || {}).messages || []).map(m => m.taskId).filter(Boolean)];
+      const taskIds = _snap?.localReplica ? [] : [..._collabTasks.keys(), ...((_snap || {}).messages || []).map(m => m.taskId).filter(Boolean)];
       // Remote attachments can arrive after the task's completion event.
       // A successful local scan is already complete; do not sweep the same
       // workspace twice more whenever a conversation is opened or settles.

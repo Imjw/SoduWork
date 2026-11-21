@@ -149,6 +149,10 @@ def main():
                                 assert server.step >= 3, (name, events, server.step)
                             assert server.calls[before:] and all(call == ('/v1/chat/completions', 'fixture')
                                                                 for call in server.calls[before:])
+                            if transport == 'acp':
+                                expected_tokens = 4 * server.step + (123999 if server.compact else 0)
+                                assert (run.get('usage') or {}).get('total') == expected_tokens, (
+                                    name, reason, expected_tokens, run.get('usage'))
                             reports.append({'transport': transport, 'content': content, 'stopReason': reason,
                                             'exit': process.returncode, 'state': run['state'], 'sameSession': True})
                         finally:

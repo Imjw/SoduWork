@@ -28,9 +28,7 @@ class AccountEndpointImportTests(unittest.IsolatedAsyncioTestCase):
                 body = self.checkpoint(1, [{"id": message_id, "position": 0, "role": "assistant",
                     "text": "retained original", "createdAt": "2026-11-07T00:00:00Z"}])
                 body["sourceSessionId"] = "native-" + str(deleted) + str(paged)
-                response = await self.http.post("/api/v1/account-conversations/sync", json=body)
-                self.assertEqual(response.status_code, 200, response.text)
-                identity = response.json()["conversationId"]
+                identity = await fixtures.seed_legacy_checkpoint(self.sessions, body)
                 if paged:
                     async with self.sessions() as session:
                         for index in range(1, 102):

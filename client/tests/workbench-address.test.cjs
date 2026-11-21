@@ -64,6 +64,17 @@ function fixture() {
   };
 }
 
+test('passive history opens a PDF using its scoped artifact id', async () => {
+  const f = fixture();
+  const file = { artifactId: 'history-pdf', name: 'notes.pdf', relative: 'outputs/notes.pdf', kind: 'pdf', primary: true };
+  f.wb.render(f.root, { localReplica: true, messages: [], tools: [] }, [file]);
+  f.wb.openOutput(file.artifactId);
+  await f.flush();
+  assert.equal(f.requests.at(-1)?.kind, 'artifact');
+  assert.equal(f.requests.at(-1)?.artifactId, file.artifactId);
+  assert.equal(f.requests.at(-1)?.target, undefined);
+});
+
 test('address presentation decodes Chinese filenames, query text and fragments once', () => {
   const { displayAddress } = fixture().info;
   const raw = 'http://127.0.0.1:4173/SoduWork-' + encodeURIComponent('中文方案😀') + '.html?q=' + encodeURIComponent('结果') + '#' + encodeURIComponent('章节');

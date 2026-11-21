@@ -1,13 +1,12 @@
 'use strict';
 
 const path = require('node:path');
-const crypto = require('node:crypto');
 const access = require('./history-access');
 const { accountId } = require('../device-auth-request');
 const executionOutcome = require('./execution-outcome.cjs');
+const { mergeNativeEvidence } = require('./history-evidence.cjs');
+const { capturedCopyId, automaticAccountCache } = require('./history-cache-policy.cjs');
 
-const capturedCopyId = (hub, account, id) => 'copy-' + crypto.createHash('sha256')
-  .update(JSON.stringify([hub, account, id])).digest('hex');
 function cloudCacheSourceId(row, identity) {
   const source = row.source;
   if (!row.cached || row.importDigest || row.importedHistory || !source?.id ||
@@ -20,12 +19,38 @@ function cloudCacheSourceId(row, identity) {
   return row.id === capturedCopyId(source.hub, source.account, source.id) ? source.id : '';
 }
 
-function create({ app, session, identityOf = () => require('./requirement-context').cachedIdentity(app), store = require('./replica-store.cjs').createWorker(
+function create({ app, session, workRoot, identityOf = () => require('./requirement-context').cachedIdentity(app), store = require('./replica-store.cjs').createWorker(
   path.join(app.getPath('userData'), 'conversation-replicas', 'history.sqlite')) }) {
   const observed = new Map();
   let closed = false, closing;
   const scoped = require('./history-scope.cjs').create({ app, store, identityOf });
+  const allowsArtifacts = row => !row.cached && !row.historyProtection && access.usesDeviceChatContext(app, { chatId: row.id }, row);
+  const deviceHistory = require('./device-history.cjs').create({ app, session, store, resolve, identityOf, register, workRoot, allowsArtifacts,
+    authorize: row => access.assertOwner(app, row.id, scoped.actor(), row),
+    authorizeContinuation: row => {
+      const captured = scoped.actor();
+      if (access.classifyLocal(app, row.id, row).kind === 'ordinary')
+        access.assertDeviceReadable(app, row.id, captured, row);
+      else access.assertOwner(app, row.id, captured, row);
+    },
+    requiresNativeEvidence: row => access.assertDeviceReadable(app, row.id, scoped.actor(), row)?.sharedOnDevice === true,
+    guard(row) {
+      const captured = scoped.actor();
+      let evidence = row;
+      return nativeRow => {
+        try {
+          const current = currentActor(captured);
+          access.assertLocalCurrent(app, captured, row, identityOf());
+          evidence = mergeNativeEvidence(evidence, nativeRow);
+          access.assertDeviceReadable(app, row.id, current, evidence);
+        } catch (error) { error.historyAccessFailure = true; throw error; }
+      };
+    } });
   const localReader = require('../app-readonly-history.cjs').create({ app,
+    session: new Proxy(session, { get: (target, key) => key === 'archivedConversation'
+      ? (_app, id) => store.get(id) : target[key] }), localOnly: true,
+    access: { actor: () => scoped.actor(), assertCurrent: (_app, actor) => scoped.guard(actor), assertOwner: access.assertDeviceReadable } });
+  const accountReader = require('../app-readonly-history.cjs').create({ app,
     session: new Proxy(session, { get: (target, key) => key === 'archivedConversation'
       ? (_app, id) => store.get(id) : target[key] }), localOnly: true,
     access: { actor: () => scoped.actor(), assertCurrent: (_app, actor) => scoped.guard(actor), assertOwner: access.assertReadable } });
@@ -42,34 +67,58 @@ function create({ app, session, identityOf = () => require('./requirement-contex
     return result;
   }
   async function projectRows(rows, archived = false, records) {
-    const native = rows.filter(isNative).map(row => {
-      const record = records ? records.get(row.id) : require('./runtime-segments').read(app, row.id);
-      return { ...require('./acceptance-session').projectHistory(app, row),
-        accountConversation: false, accountProjection: false,
-        archived: row.archived === true || session.isArchived?.(app, row.id) === true ||
-        (archived && (!row.adapterId || row.adapterId === 'pi')), historyAliasIds: [...new Set([
-        ...(row.historyAliasIds || []), ...[...(record?.segments || []), record?.active].filter(Boolean).map(part => part.sessionId),
-      ])].filter(id => id !== row.id) };
-    });
+    const native = [], discovered = rows.filter(isNative);
+    for (let offset = 0; offset < discovered.length; offset += 200) {
+      const batch = discovered.slice(offset, offset + 200);
+      // Discovery must not fill the worker's entire request queue before a
+      // foreground delete can be admitted. Transfer predecessors are native
+      // identities, so this indexed lookup never follows remote origin aliases.
+      const existing = await store.nativeRows(batch.map(row => row.id), { includeDeleted: true });
+      const previousRows = new Map();
+      for (const row of existing) for (const id of [row.id, ...row.historyAliasIds]) previousRows.set(id,row);
+      for (const row of batch) {
+        const previous = previousRows.get(row.id);
+        if (previous?.deviceTransferId &&
+            require('./runtime-segments').read(app, previous.id)?.deviceTransferId !== previous.deviceTransferId) {
+          native.push(previous); continue;
+        }
+        const record = records ? records.get(row.id) : require('./runtime-segments').read(app, row.id);
+        native.push({ ...require('./acceptance-session').projectHistory(app, row),
+          accountConversation: false, accountProjection: false,
+          archived: row.archived === true || session.isArchived?.(app, row.id) === true ||
+          (archived && (!row.adapterId || row.adapterId === 'pi')), historyAliasIds: [...new Set([
+          ...(row.historyAliasIds || []), ...[...(record?.segments || []), record?.active].filter(Boolean).map(part => part.sessionId),
+        ])].filter(id => id !== row.id) });
+      }
+      if (offset + batch.length < discovered.length) await new Promise(resolve => setImmediate(resolve));
+    }
     for (const row of native) if (row.historyAliasIds.length) await store.join(row.id, row.historyAliasIds);
     let registered = await register(native);
     const actor = scoped.actor();
-    registered = await Promise.all(registered.map(async row => {
-      const recovered = executionOutcome.recover(row);
-      if (!recovered || row.state === recovered.state && row.status === recovered.status && row.live === false ||
-          !scoped.readable(row, actor)) return row;
-      scoped.guard(actor);
-      const [saved] = await register([recovered], { expectedRevision: row.revision });
-      scoped.guard(actor); return saved;
-    }));
+    const repaired = [];
+    for (let offset = 0; offset < registered.length; offset += 32) {
+      repaired.push(...await Promise.all(registered.slice(offset,offset + 32).map(async row => {
+        const recovered = executionOutcome.recover(row);
+        if (!recovered || row.state === recovered.state && row.status === recovered.status && row.live === false) return row;
+        try { access.assertLocalMutation(app, row.id, actor, row); } catch (_) { return row; }
+        scoped.guard(actor);
+        const [saved] = await register([recovered], { expectedRevision: row.revision });
+        scoped.guard(actor); return saved;
+      })));
+    }
+    registered = repaired;
     registered = registered.filter(Boolean);
+    deviceHistory.schedule(registered.filter(row => scoped.readable(row, actor)));
     const byId = new Map();
     for (const row of registered) for (const id of [row.id, ...row.historyAliasIds]) byId.set(id, row);
     return rows.map(row => byId.get(row.id) || row).filter(row => !row.deleted && (row.archived === true) === archived && scoped.readable(row, actor));
   }
   async function resolveRaw(id) {
     let row = await store.get(id);
-    if (row) return row;
+    if (row && !automaticAccountCache(row)) return row;
+    if (row && isLocalIdentity(row, id)) return null;
+    // Retired remote locators cannot shadow an actual native archive while
+    // its local index is still being rebuilt after a restart.
     if (/^(?:acct-|cloud-execution:|task-execution:)/.test(id)) return null;
     const pi = await session.historyEntry?.(app, id, { strict: true });
     if (pi?.ok && pi.entry?.path) {
@@ -199,14 +248,42 @@ function create({ app, session, identityOf = () => require('./requirement-contex
     const row = await resolve(id, captured);
     if (!row || row.deleted) throw Error('这条会话已经不存在了');
     access.assertLocalCurrent(app, captured, row, identityOf());
-    access.assertReadable(app, row.id, currentActor(captured), row);
+    access.assertDeviceReadable(app, row.id, currentActor(captured), row);
+    let accountEvidence = row;
+    const verify = options.accountOnly === true ? nativeRow => {
+      accountEvidence = mergeNativeEvidence(accountEvidence, nativeRow);
+      access.assertReadable(app, row.id, currentActor(captured), accountEvidence);
+    } : undefined;
+    verify?.();
+    async function verifyCurrent() {
+      if (!verify) return;
+      const latest = await resolve(row.id, captured);
+      if (!latest) throw Error('会话归属已变化，请重新打开');
+      access.assertReadable(app, latest.id, currentActor(captured), latest);
+    }
     const after = Number(options.after || 0);
     if (!Number.isSafeInteger(after) || after < 0) throw Error('Invalid local history cursor');
     if (row.cached) {
       const page = await store.messages(row.id, { after: after - 1, limit: options.limit || 100 });
       if (!await resolve(row.id, captured)) throw Error('会话归属已变化，请重新打开');
       access.assertLocalCurrent(app, captured, row, identityOf());
+      await verifyCurrent();
       return { ...page, nextCursor: page.next == null ? null : page.next + 1, cursor: page.items.at(-1)?.position + 1 || after };
+    }
+    const saved = await deviceHistory.saved(row.id, { refresh: after === 0, verify });
+    scoped.guard(captured);
+    verify?.();
+    if (saved) {
+      const limit = Math.min(200, Math.max(1, options.limit || 100));
+      const messages = saved.snapshot.messages, end = Math.min(messages.length, after + limit);
+      const items = await Promise.all(messages.slice(after, end).map(async (message, index) => ({ ...message,
+        position: after + index, id: message.id || row.id + ':' + (after + index),
+        ...(message.attachments?.length ? { attachments: await deviceHistory.attachments(message) } : {}),
+        historyTools: saved.snapshot.tools.filter(tool => Number(tool.after || 0) === after + index) })));
+      scoped.guard(captured);
+      await verifyCurrent();
+      return { items, format: 'messages', cursor: end, nextCursor: end < messages.length ? end : null,
+        coverage: saved.coverage, nativeReadError: saved.nativeReadError };
     }
     // Encode the segment in the cursor so phones and passive desktop views
     // traverse runtime switches without mixing sequence namespaces.
@@ -215,10 +292,11 @@ function create({ app, session, identityOf = () => require('./requirement-contex
     const parts = record ? [...new Set([...record.segments, record.active].filter(Boolean).map(part => part.sessionId))] : [row.id];
     const segment = Math.floor(after / span), offset = after % span;
     if (segment >= parts.length) throw Error('Invalid local history segment');
-    const page = await localReader('conversations.read', { id: row.id, offset, after: offset,
+    const page = await (options.accountOnly === true ? accountReader : localReader)('conversations.read', { id: row.id, offset, after: offset,
       limit: options.limit || 100, segmentId: parts[segment] });
     if (!await resolve(row.id, captured)) throw Error('会话归属已变化，请重新打开');
     access.assertLocalCurrent(app, captured, row, identityOf());
+    await verifyCurrent();
     const next = page.nextOffset ?? page.nextAfter;
     const cursor = segment * span + (page.cursor ?? offset + (page.items || []).length);
     return { ...page, cursor,
@@ -226,15 +304,54 @@ function create({ app, session, identityOf = () => require('./requirement-contex
         ...(page.format === 'events' ? { streamId: parts[segment] + ':' + item.streamId, revision: segment * span + Number(item.id) } : {}) })),
       nextCursor: next != null ? segment * span + next : segment + 1 < parts.length ? (segment + 1) * span : null };
   }
-  async function open(id) {
+  async function open(id, { historyPreview = false, allowContinuation = false, previewReason = '' } = {}) {
     const captured = scoped.actor(), row = await resolve(id, captured);
     if (!row || row.deleted) return null;
-    const view = await require('./local-history-view.cjs').create({ row,
-      read: (id, options) => read(id, options, captured) });
+    let content = null, bodyMissing = false;
+    if (!row.cached) {
+      try { content = await deviceHistory.saved(row.id, { refresh: true }); }
+      catch (error) { if (error.code !== 'NATIVE_HISTORY_MISSING') throw error; bodyMissing = true; }
+    }
+    const nativeUnavailable = content?.nativeReadError && content.nativeReadError.code !== 'NATIVE_HISTORY_MISSING';
+    const view = await require('./local-history-view.cjs').create({ historyPreview, allowContinuation:
+      allowContinuation && !row.cached && !content?.historyProtection && !nativeUnavailable &&
+      access.usesDeviceChatContext(app, { chatId: row.id }, row),
+      previewReason: nativeUnavailable ? '可查看已有本机记录。原始档案暂时无法核验，请恢复后再继续' : previewReason,
+      row: { ...row,
+      ...(content ? { deviceHistory: true, historyContentState: !content.coverage?.complete ? 'partial' :
+        require('./device-history-native.cjs').unresolvedTools(content.snapshot).length || content.coverage?.unresolvedTools?.length
+          ? 'unresolved-tools' : 'available' } : {}),
+      ...(bodyMissing ? { historyContentState: 'missing' } : {}) },
+      read: bodyMissing ? async () => ({ items: [], nextCursor: null }) : (id, options) => read(id, options, captured) });
     scoped.guard(captured);
     for (const name of ['snapshot', 'uiSnapshot', 'historyRow']) {
       const original = view[name];
-      view[name] = (...args) => { access.assertReadable(app, row.id, currentActor(captured), row); return original(...args); };
+      view[name] = (...args) => { access.assertDeviceReadable(app, row.id, currentActor(captured), row); return original(...args); };
+    }
+    if (historyPreview && content?.localArtifactHistory && !content.imported && !content.historyProtection && allowsArtifacts(row)) {
+      let disposed = false;
+      const close = view.close;
+      view.close = async () => { disposed = true; return close(); };
+      const guard = () => {
+        if (disposed) throw Error('会话已关闭，请重新打开成果');
+        access.assertDeviceReadable(app, row.id, currentActor(captured), row);
+        if (!allowsArtifacts(row)) throw Error('会话归属已变化，请重新打开成果');
+      };
+      const authorize = async () => {
+        const latest = await resolve(row.id, captured);
+        if (!latest || latest.deleted || latest.cwd !== row.cwd || !allowsArtifacts(latest) ||
+            await store.deviceHistoryVersion(row.id) !== content.digest)
+          throw Error('会话归属或历史版本已变化，请重新打开成果');
+        if (row.adapterId === 'pi') await require('./device-history-native.cjs').probe({ app, session, row: latest,
+          guard: evidence => {
+            guard();
+            if (!allowsArtifacts(mergeNativeEvidence(latest, evidence))) throw Error('会话归属已变化，请重新打开成果');
+          } });
+        guard();
+        if (!allowsArtifacts(latest))
+          throw Error('会话归属已变化，请重新打开成果');
+      };
+      view.historyArtifacts = require('./device-history-artifacts.cjs').view(row.cwd, content.localArtifactHistory, guard, authorize);
     }
     const load = view.loadHistory;
     view.loadHistory = async (...args) => { scoped.guard(captured); await load(...args); scoped.guard(captured); };
@@ -268,6 +385,10 @@ function create({ app, session, identityOf = () => require('./requirement-contex
     if (closed || handle.localReplica || typeof handle.snapshot !== 'function') return;
     const snapshot = handle.snapshot(), original = handle.historyRow?.(snapshot);
     if (!original?.id) return;
+    const previousImport = await store.get(original.id);
+    if (previousImport?.deviceTransferId &&
+        require('./runtime-segments').read(app, previousImport.id)?.deviceTransferId !== previousImport.deviceTransferId) return;
+    if (original.accountProjection && !original.cloud) return;
     // A cache has its own identity so deleting it cannot delete or hide the
     // account-authorized cloud original in the cloud directory.
     const remote = original.cloud || original.accountProjection;
@@ -296,7 +417,20 @@ function create({ app, session, identityOf = () => require('./requirement-contex
       ...(original.taskProjectionId && !original.taskId ? { taskId: original.taskProjectionId } : {}),
       remoteProjection: false, cached: !!remote, source: remote ? { hub: identity?.hub, id: original.id, account: accountId(identity) } : null,
       creator: { account: accountId(identity), hub: identity?.hub }, historyAliasIds: remote ? [] : original.historyAliasIds || [] }]);
-    if (row.deleted || !remote) return;
+    if (row.deleted) return;
+    if (!remote) {
+      try { await deviceHistory.refresh(row.id, { journal: handle.fileChanges || snapshot.fileChanges }); }
+      catch (error) {
+        // A failed native read keeps the previous complete copy. The runtime
+        // snapshot is still useful as explicitly partial crash-recovery data.
+        if (!await store.deviceHistory(row.id)) await store.saveDeviceHistory(row.id, {
+          snapshot: require('./device-history-native.cjs').publicSnapshot(snapshot),
+          coverage: { complete: false }, nativeReadError: { code: error.code || 'NATIVE_HISTORY_UNAVAILABLE', reason: error.message },
+        }, { expectedRevision: row.replicaRevision, expectedTransferId: row.deviceTransferId || '' });
+        handle.localHistoryError = String(error.message || error);
+      }
+      return;
+    }
     const messages = (snapshot.messages || []).filter(message => ['user', 'assistant'].includes(message.role));
     const offset = Number(snapshot.history?.messageStart || 0);
     const complete = !snapshot.history?.truncated && offset === 0;
@@ -363,6 +497,8 @@ function create({ app, session, identityOf = () => require('./requirement-contex
     return scoped.directory(after, limit, captured);
   }
   return { resolve, read, open, register, projectRows, lifecycle, deleteCloudCaches, remoteLifecycle, accountDisplayLinks, capture, observe, store, directory, preserveLegacyOutbox,
+    exportPortable: deviceHistory.exportPortable, importPortable: deviceHistory.importPortable,
+    prepareContinuation: deviceHistory.prepareContinuation, backfill: deviceHistory.refresh,
     captureScope: () => scoped.actor(), guardScope: captured => scoped.guard(captured),
     async indexedRow(id) {
       const captured = scoped.actor(), row = await store.get(id);
@@ -386,12 +522,14 @@ function create({ app, session, identityOf = () => require('./requirement-contex
         const page = await scoped.list({ archived, after, limit: Math.min(200, Math.max(1, limit - items.length)) }, captured);
         items.push(...page.items); after = page.next;
       } while (after && items.length < limit);
-      return access.visible(app, items, identityOf());
+      // The desktop IPC rechecks merged rows. Keep native owner evidence
+      // inside the main process until that last check projects the public row.
+      return access.authorizedRows(app, items, identityOf(), true);
     },
     close() { return closing ||= (async () => {
       for (const entry of observed.values()) entry.dispose();
       await Promise.all([...observed.values()].map(entry => entry.flush()));
-      closed = true; observed.clear(); await store.close();
+      closed = true; observed.clear(); await deviceHistory.close(); await store.close();
     })(); } };
 }
 // Source locators permit passive transcript recovery, not lifecycle ownership

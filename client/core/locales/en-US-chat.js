@@ -1,5 +1,11 @@
 (function (global) {
   const messages = {
+    "模型目录暂时不可用": "The model catalog is temporarily unavailable",
+    "使用底座账号默认模型": "Use the Agent account’s default model",
+    "目标底座没有可明确选择的可用模型": "No model can be selected unambiguously for this Agent",
+    "当前模型无法用于目标底座": "This Agent cannot use the selected model",
+    "切换后使用": "Model to use after switching",
+    "使用此模型并切换": "Use this model and switch",
     "你已停止": "You stopped",
     "你在 {seconds} 秒后停止了": "You stopped after {seconds} seconds",
     "你在 {minutes} 分 {seconds} 秒后停止了": "You stopped after {minutes}m {seconds}s",

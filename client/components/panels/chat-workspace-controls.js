@@ -144,7 +144,7 @@ function restoreFileView(tab) {
   }
 
 function canEditFile(file) {
-    return Boolean(file && !file.readSnapshot && !file.taskId && (file.path || file.relative));
+    return Boolean(file && !ctx.WB?.historyPreview && !file.readSnapshot && !file.taskId && (file.path || file.relative));
   }
 
 function isCodeFile(file) {

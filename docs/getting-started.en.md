@@ -74,7 +74,7 @@ If the model is missing, refresh the catalog or reopen the desktop model selecto
 
 Local services added in the desktop's **My models** panel are encrypted in that desktop profile. Their endpoints, keys, model references, and local usage are not uploaded to Hub. Select them in a local Pi conversation; cloud execution, handoff, scheduled tasks, and Hub model defaults require a Hub-managed model. Local image/video definitions remain stored but are not offered through the Hub media proxy.
 
-Signing in to the desktop is still required, and existing conversation and task permissions still apply. After sign-in, Hub model administration and model quotas do not control a local Pi model. The desktop connects directly to its provider. Ordinary conversation directory synchronization continues without model configuration, references, or local usage.
+Signing in to the desktop is still required, and existing conversation and task permissions still apply. After sign-in, Hub model administration and model quotas do not control a local Pi model. The desktop connects directly to its provider. Local conversations and their directory stay on the PC. The Hub maintains the history of cloud conversations.
 
 Local choices and runtime transcripts use random model references. The mapping to the real model ID, label, endpoint, and credential stays in the encrypted local catalog; runtime files use placeholders. Existing structured local references migrate without changing message text or acknowledged Hub usage. Removing and re-adding a model does not silently reconnect an old conversation to the new model. This does not encrypt conversation text or files you create, and does not remove copies in external backups.
 
@@ -82,7 +82,9 @@ If secure storage cannot be read, the client preserves the saved configuration a
 
 ### Conversation history after switching accounts
 
-Recent conversations, local history, and archives show records belonging to the current account and Hub. Switching accounts or services does not delete the originals. Return to the original account and Hub to view history with verified ownership. Expired short-lived credentials still allow offline viewing under the retained, verified local owner; explicit sign-out hides that account's history.
+When two accounts sign in to the same Hub using the same desktop profile on one PC, both can see ordinary local chats in the sidebar and archives. Open a chat from the sidebar to continue under the signed-in account. Conversations containing private memory, requirements, acceptance reviews or automation forms retain their account restrictions, as do cloud conversations and imported copies. Signing out hides history until the next sign-in and preserves the files on disk.
+
+If short-lived credentials expire, the desktop can still use retained, verified ownership to display eligible local history offline.
 
 For old Pi conversations with no ownership record, use **Archive → Import old Pi conversation** in the desktop, select a JSONL file from the local native index, and confirm creation of a read-only copy for the current account. The original stays unchanged; tool permissions and execution state are not restored. Supported Pi files must be readable in full, with a maximum of 32 MiB and 10,000 messages. Unsupported message or attachment formats are rejected rather than silently omitted. Existing foreign or conflicting ownership cannot be bypassed through this import.
 

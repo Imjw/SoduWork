@@ -15,7 +15,7 @@ const { openReply } = require('../main/pi-session/open-reply');
 const switchable = require('../main/agent-runtime/switchable-conversation');
 const archiveState = require('../main/pi-session/archive-state');
 
-async function fixture(t, { accountAlias = true } = {}) {
+async function fixture(t, { accountAlias = true, protectedRow = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sw-history-roundtrip-'));
   const app = { getPath: () => root }, actor = identity();
   const record = { version: 1, id: 'public-a', owner: segments.scope(actor), cwd: root, at: 10,
@@ -34,6 +34,8 @@ async function fixture(t, { accountAlias = true } = {}) {
     { id: 'public-a', creator, adapterId: 'pi', title: record.title, at: 10, count: 2 },
     { id: 'runner-a', creator, adapterId: 'opencode', title: 'Later segment request', at: 20, count: 4 },
     { id: 'local-second', creator, adapterId: 'pi', title: 'Independent conversation', at: 9, count: 2 },
+    ...(protectedRow ? [{ id: 'protected-third', creator, workOwner: segments.scope(actor), adapterId: 'pi',
+      historyProtection: 'account', title: 'Private requirement conversation', at: 8, count: 2 }] : []),
   ];
   let bridge, history, sync;
   async function start() {
@@ -73,20 +75,24 @@ async function fixture(t, { accountAlias = true } = {}) {
   };
 }
 
-test('account A to B to A and restart isolate durable native rows without losing them', async t => {
-  const f = await fixture(t);
+test('account A to B to A retains ordinary device chats while protecting task and remote account histories', async t => {
+  const f = await fixture(t, { protectedRow: true });
   const first = await f.read();
-  assert.deepEqual(first.chats.map(row => row.id).sort(), ['local-second', 'public-a', 'remote-a']);
+  assert.deepEqual(first.chats.map(row => row.id).sort(), ['local-second', 'protected-third', 'public-a', 'remote-a']);
   for (const account of ['b', 'a']) {
     f.switch(account);
     const next = await f.read();
-    assert.deepEqual(next.chats.map(row => row.id).sort(), account === 'a' ? ['local-second', 'public-a', 'remote-a'] : ['remote-b']);
+    assert.deepEqual(next.chats.map(row => row.id).sort(), account === 'a'
+      ? ['local-second', 'protected-third', 'public-a', 'remote-a'] : ['local-second', 'public-a', 'remote-b']);
+    assert.deepEqual((await f.history.directory(0,100)).items.map(row=>row.id).sort(),
+      account === 'a' ? ['local-second','protected-third','public-a'] : [],
+      'A mobile directory cannot inherit same-PC sharing permissions');
     if (account === 'a') assert.equal(next.chats.find(row => row.id === 'public-a').title, f.record.title);
     assert.equal(next.chats.some(row => row.id === 'remote-' + (account === 'a' ? 'b' : 'a')), false);
   }
   await f.restart();
   const restored = await f.read();
-  assert.deepEqual(restored.chats.map(row => row.id).sort(), ['local-second', 'public-a', 'remote-a']);
+  assert.deepEqual(restored.chats.map(row => row.id).sort(), ['local-second', 'protected-third', 'public-a', 'remote-a']);
   const native = restored.chats.find(row => row.id === 'public-a');
   assert.equal(native.title, f.record.title, 'a later native segment cannot rename the public conversation');
   assert.equal(native.localReplica, true);

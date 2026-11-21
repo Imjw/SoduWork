@@ -33,6 +33,7 @@
   }
 
   function _workModel() {
+    if (ctx._snap?.execution?.canContinueOnDevice === true) return ctx._sessionOptions.modelName || '';
     if (ctx._snap && ctx._snap.modelSelection) return ctx._snap.modelSelection.name || ctx._snap.modelSelection.model?.id || '';
     return ctx._sessionOptions.modelName || (ctx._model && (ctx._model.name || ctx._model.id)) || '';
   }

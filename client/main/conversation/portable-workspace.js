@@ -12,7 +12,7 @@ const MAX_BYTES = 96 * 1024 * 1024;
 const MAX_TRANSCRIPT = 2 * 1024 * 1024;
 const MAX_DEPTH = 32;
 const SKIP_DIRS = new Set(['.git', '.svn', '.hg', 'node_modules', '.venv', 'venv', '__pycache__',
-  '.ssh', '.aws', '.azure', '.config', '.soduwork', '.pi', '.codex', '.claude', '.opencode']);
+  '.ssh', '.aws', '.azure', '.config', '.soduwork', '.pi', '.codex', '.claude', '.opencode', 'soduworklibrary']);
 const SECRET_FILE = /^(?:\.env(?:\..*)?|\.npmrc|\.pypirc|credentials(?:\..*)?|id_(?:rsa|dsa|ecdsa|ed25519)(?:\..*)?)$|\.(?:pem|p12|pfx|key)$/i;
 const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 
@@ -122,4 +122,5 @@ async function create(root, metadata, options = {}) {
   return { bytes, sha256: sha256(bytes), manifest, total: snapshot.total };
 }
 
-module.exports = { SCHEMA, MAX_FILES, MAX_BYTES, MAX_TRANSCRIPT, portablePath, safeMetadata, scan, create };
+module.exports = { SCHEMA, MAX_FILES, MAX_BYTES, MAX_TRANSCRIPT, portablePath, safeMetadata, scan, readStable, create,
+  excludedName: name => SKIP_DIRS.has(name.toLowerCase()) || SECRET_FILE.test(name) };

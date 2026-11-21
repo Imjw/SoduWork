@@ -28,10 +28,12 @@ function _awaitBounded(promise, timeoutMs, label) {
     });
   }
 
-async function _ensure(chatId) {
+async function _ensure(chatId, previewRef = '') {
     // Form-only conversations have persistent archives; the first ordinary message continues that session.
     chatId = chatId || ctx._sessionId || undefined;
-    if (ctx._ref) {
+    if (previewRef) {
+      if (previewRef !== ctx._ref || ctx._snap?.execution?.canContinueOnDevice !== true || chatId !== ctx._sessionId) return false;
+    } else if (ctx._ref) {
       if (chatId && String(chatId) !== String(ctx._sessionId)) return false;
       return true;
     }
@@ -69,7 +71,7 @@ async function _ensure(chatId) {
         }
         if (!await ctx._workCards.ensureDraftSelectionSaved() || !current() || draftId !== ctx._sessionId) return false;
       }
-      return _ensureOnce(chatId, epoch, owner, current);
+      return _ensureOnce(chatId, epoch, owner, current, previewRef);
     })();
     task.archiveTarget = chatId || ''; task.ownerScope = owner;
     ctx._openingTask = task;
@@ -82,7 +84,7 @@ async function _ensure(chatId) {
          same explicit, retryable UI used by structured open errors. */
       if (current()) {
         const reason = String((error && error.message) || error || '');
-        if (chatId) {
+        if (chatId && !previewRef) {
           const previousSnapshot = ctx._snap || {};
           ctx._snap = { ...previousSnapshot, openBlocked: true, sessionNotFound: false,
             sessionOpenCode: typeof error?.code === 'string' ? error.code : '',
@@ -100,15 +102,19 @@ async function _ensure(chatId) {
     }
   }
 
-async function _ensureOnce(chatId, epoch, ownerScope = ctx._draftOwnerScope?.() || '', isCurrent) {
+async function _ensureOnce(chatId, epoch, ownerScope = ctx._draftOwnerScope?.() || '', isCurrent, previewRef = '') {
     const current = () => epoch === ctx._viewEpoch && ownerScope === (ctx._draftOwnerScope?.() || '') && (!isCurrent || isCurrent());
+    const previewSnapshot = previewRef && ctx._snap, previousListener = ctx._off;
     let attachedRef = '';
     const failOpen = (title, reason, failure) => {
       const failedRef = chatId ? attachedRef : ''; attachedRef = '';
       if (failedRef && typeof api?.release === 'function')
         void Promise.resolve().then(() => api.release(failedRef)).catch(() => {});
       if (!current()) return false;
-      if (chatId) {
+      if (previewRef) {
+        if (ctx._off !== previousListener) ctx._off?.();
+        ctx._ref = previewRef; ctx._off = previousListener; ctx._snap = previewSnapshot;
+      } else if (chatId) {
         const previousSnapshot = ctx._snap || {};
         ctx._ref = ''; ctx._sessionId = String(chatId);
         ctx._snap = { ...previousSnapshot, openBlocked: true,
@@ -126,8 +132,15 @@ async function _ensureOnce(chatId, epoch, ownerScope = ctx._draftOwnerScope?.() 
       // process. A separate serial probe delays model/policy preparation and
       // repeats CLI discovery; use the authoritative open result instead.
       const resumeAsOrdinary = ctx._sessionOptions.resumeAsOrdinary === true;
-      const openOptions = chatId
-        ? { ...ctx._sessionOptions, chatId, requireTaskBinding: !resumeAsOrdinary && Boolean(ctx._sessionOptions.taskRef) }
+      const selected = ctx._sessionOptions;
+      const openOptions = previewRef
+        ? { chatId, historyIntent: 'continue', adapterId: selected.adapterId, modelName: selected.modelName,
+          ...(selected.reasoningEffort ? { reasoningEffort: selected.reasoningEffort } : {}),
+          ...(selected.thinkingLevel ? { thinkingLevel: selected.thinkingLevel } : {}),
+          accessMode: selected.accessMode === 'readonly' ? 'readonly' : 'standard' }
+        : chatId
+        ? { ...selected, chatId, ...(!ctx._snap?.workOnly ? { historyIntent: 'view' } : {}),
+          requireTaskBinding: !resumeAsOrdinary && Boolean(selected.taskRef) }
         : { ...ctx._sessionOptions };
       let openTimedOut = false;
       const openPromise = Promise.resolve().then(() => api.open(openOptions));
@@ -155,7 +168,7 @@ async function _ensureOnce(chatId, epoch, ownerScope = ctx._draftOwnerScope?.() 
       if (!got || !got.ok) {
         const reason = String(got && got.reason || '');
         const missing = Boolean(got && got.notFound === true);
-        if (chatId && missing) {
+        if (chatId && missing && !previewRef) {
           // A deleted archive must not remain as a clickable stale sidebar row,
           // and its requirement bindings must not hijack the next open attempt.
           if (global.WorkspaceShell && typeof WorkspaceShell.removeChat === 'function') {
@@ -174,6 +187,10 @@ async function _ensureOnce(chatId, epoch, ownerScope = ctx._draftOwnerScope?.() 
       }
       const openedRef = String(got.ref || '').trim();
       const openedSessionId = String(got.sessionId || chatId || '').trim();
+      if (previewRef && (openedRef === previewRef || openedSessionId !== chatId || !got.sessionId || got.localReplica || got.snapshot?.execution?.readOnly)) {
+        if (openedRef && openedRef !== previewRef) await api.release?.(openedRef);
+        return failOpen('无法继续会话', got.snapshot?.historyRecovery?.reason || '这条历史当前仅可查看');
+      }
       if (!openedRef || !openedSessionId) {
         if (openedRef && typeof api.release === 'function') await api.release(openedRef);
         return failOpen('开不了对话', '执行底座没有返回有效的会话标识', {code:'INVALID_SESSION_REPLY'});
@@ -252,6 +269,10 @@ async function _ensureOnce(chatId, epoch, ownerScope = ctx._draftOwnerScope?.() 
       if (got.snapshot?.cloudHandoff?.phase === 'committed') ctx._sessionOptions = { ...ctx._sessionOptions, intent: '', goal: '' };
       ctx._sessionOptions = { ...ctx._sessionOptions, adapterId: got.adapterId || openedSnapshot.adapterId || ctx._sessionOptions.adapterId || 'pi',
         displayName: got.displayName || openedSnapshot.displayName || '', accessControl: got.accessControl || openedSnapshot.accessControl };
+      if (openedSnapshot.execution?.canContinueOnDevice === true) {
+        // A preview carries no executable model, elevated permissions or account-specific draft choices.
+        ctx._sessionOptions = { adapterId: ctx._sessionOptions.adapterId };
+      }
       if (resumeAsOrdinary) {
         // The marker is renderer-only and must never leak into the persisted
         // goal/task session options after the ordinary archive is reopened.
@@ -397,6 +418,10 @@ async function _ensureOnce(chatId, epoch, ownerScope = ctx._draftOwnerScope?.() 
       }
       ctx._pullOuts();                      // Restore files created earlier in a resumed conversation.
       ctx.refreshHistory();                 // Show newly opened or resumed conversations in the sidebar immediately.
+      if (previewRef) {
+        try { previousListener?.(); } catch (_) { /* The completed switch no longer needs the preview listener. */ }
+        if (previewRef !== openedRef) void Promise.resolve(api.release?.(previewRef)).catch(() => {});
+      }
       return true;
     } catch (e) {
       return failOpen('开对话时出错', String((e && e.message) || e), e);
@@ -455,7 +480,7 @@ async function _send(textOverride, sendOptions) {
 async function _sendCore(textOverride, sendOptions) {
     // A refused archive may have no native id yet. Never turn its retained
     // input into a new conversation; reopen it after resolving the error.
-    if (ctx._snap?.openBlocked) return false;
+    if (ctx._snap?.openBlocked || ctx._snap?.localReplica && ctx._snap.execution?.canContinueOnDevice !== true) return false;
     const el = ctx._mount();
     if (!el) return false;
     const accessEpoch = ctx._viewEpoch, sendScopeEpoch = ctx._draftScopeEpoch, sendOwnerScope = ctx._draftOwnerScope();
@@ -521,6 +546,14 @@ async function _sendCore(textOverride, sendOptions) {
       if (routed.handled) return routed.accepted;
     }
     if (accessEpoch !== ctx._viewEpoch || sendScopeEpoch !== ctx._draftScopeEpoch || sendOwnerScope !== ctx._draftOwnerScope() || ctx._pluginResolveBusy) return false;
+    if (ctx._snap?.execution?.canContinueOnDevice === true) {
+      const previewRef = ctx._ref;
+      if (!previewRef || !ctx._sessionId || !await _ensure(ctx._sessionId, previewRef) || ctx._ref === previewRef ||
+          ctx._snap?.localReplica || accessEpoch !== ctx._viewEpoch ||
+          sendScopeEpoch !== ctx._draftScopeEpoch || sendOwnerScope !== ctx._draftOwnerScope()) return false;
+      retainedRef = ctx._ref;
+      retainedApi = ctx._api();
+    }
     const sendEpoch = ctx._viewEpoch, resolveSeq = ++ctx._pluginResolveSeq;
     let sendDraftKey = ctx._draftKeyForCurrentSession();
     const sendProjectId = ctx._sessionOptions.projectId || '';

@@ -4,14 +4,22 @@ const { project } = require('./history-message.cjs');
 
 // Passive history never constructs a runtime or imports source credentials.
 // Retain only message indexes and page cursors between bounded window reads.
-async function create({ row, read }) {
+async function create({ row, read, historyPreview = false, allowContinuation = false, previewReason = '' }) {
   const MAX_BYTES = 8 * 1024 * 1024, MAX_MESSAGE_BYTES = 2 * 1024 * 1024;
   let closed = false, pending, indexed = false;
   const entries = [], streams = new Map();
   let value = { messages: [], tools: [], status: 'idle', adapterId: row.adapterId || 'pi',
     displayName: row.displayName || row.adapterId || 'Pi', modelSelection: {},
     accessControl: { mode: 'readonly', capabilities: [] },
-    execution: { readOnly: true, localReplica: true }, localReplica: true };
+    execution: { readOnly: true, localReplica: true, ...(historyPreview ? {
+      canContinueOnDevice: allowContinuation && row.historyContentState === 'available' } : {}) }, localReplica: true };
+  if (['missing', 'partial', 'unresolved-tools'].includes(row.historyContentState)) value.historyRecovery = {
+    mode: row.historyContentState === 'missing' ? 'metadata-only' : 'device-history',
+    bodyMissing: row.historyContentState === 'missing', incomplete: true,
+    reason: row.historyContentState === 'missing' ? '仅剩会话标题，正文文件已丢失，无法恢复原会话内容' :
+      row.historyContentState === 'unresolved-tools' ? '历史中有工具缺少终结回执，结果尚未确认，暂时只能查看，不能恢复执行或迁移' : '仅保存了部分历史，无法完整恢复执行上下文',
+  };
+  else if (historyPreview && previewReason) value.historyRecovery = { mode: 'device-history', reason: previewReason };
   const keyFor = (page, item, cursor, index) => page.format === 'events'
     ? 'stream:' + String(item.streamId || item.id || cursor + ':' + index)
     : 'message:' + cursor + ':' + index;
@@ -37,7 +45,7 @@ async function create({ row, read }) {
     return { apply, has: index => messages.has(index), publish() {
       const indices = [...messages.keys()].sort((a, b) => a - b);
       const visible = indices.map(index => messages.get(index));
-      const tools = row.importedHistory === true ? visible.flatMap((message, after) =>
+      const tools = row.importedHistory || row.deviceHistory ? visible.flatMap((message, after) =>
         (Array.isArray(message.historyTools) ? message.historyTools : []).map(tool => ({ ...tool, after }))) : [];
       value = { ...value, messages: visible, tools, history: {
         totalMessages: entries.length, messageLimit: limit, messageIndices: indices,
@@ -98,7 +106,8 @@ async function create({ row, read }) {
     try { await job; } finally { if (pending === job) pending = null; }
   }
   await loadHistory();
-  return { ref: 'local-history-' + row.id, sessionId: row.id, adapterId: value.adapterId,
+  const ref = historyPreview ? 'local-history-preview-' + require('node:crypto').randomUUID() : 'local-history-' + row.id;
+  return { ref, sessionId: row.id, adapterId: value.adapterId, historyPreview,
     localReplica: true, readOnly: true, ui: { mode: 'readonly', title: row.title || '', capabilities: [] },
     snapshot: () => value, uiSnapshot: () => value, historyRow: () => row, loadHistory,
     status: () => 'idle', on: () => () => {}, inFlight: () => false, close: async () => { closed = true; streams.clear(); entries.length = 0; return true; },

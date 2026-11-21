@@ -21,7 +21,7 @@ function fixture(overrides = {}) {
       const start = source.indexOf('function renderChats() {');
       const end = source.indexOf('function subscribeConversationPresence', start);
       assert.ok(start > 0 && end > start);
-      source = source.slice(0, start) + 'function renderChats() {}\n' + source.slice(end);
+      source = source.slice(0, start) + 'function renderChats() { ctx.paint?.(); }\n' + source.slice(end);
     }
     vm.runInNewContext(source, { window });
   }
@@ -206,6 +206,21 @@ test('offline, denied and cancelled deletion preserve cached titles; late succes
 });
 
 for (const operation of ['archiveHistoryChat', 'deleteHistoryChat']) {
+  test(operation + ' paints the acknowledged removal before a slow new-conversation navigation', async () => {
+    const f = fixture(), navigation = deferred(), paints = [];
+    f.api.setChats([row(), row('other')]);
+    f.ctx.activeChatId = 'conversation'; f.ctx.active = 'create';
+    f.ctx.paint = () => paints.push({ ids: f.ids(), active: f.ctx.activeChatId });
+    f.window.WorkspaceHost = { open: () => navigation.promise };
+    let settled = false;
+    const pending = f.api[operation]('conversation').then(value => { settled = true; return value; });
+    await tick();
+    assert.equal(settled, false, 'the real navigation remains pending');
+    assert.deepEqual(paints.at(-1), { ids: ['other'], active: '' });
+    navigation.resolve(true);
+    assert.equal(await pending, true);
+  });
+
   test(operation + ' rejects an older history response and late ordinary presence', async () => {
     const f = fixture(), item = row(); f.api.setChats([item]);
     const old = f.api.refreshConversationHistory(); await tick();

@@ -28,6 +28,8 @@
   let offModels = null;
   let searchQuery = '';
   let nativeView = 'effort';
+  let preparedCatalog = null;
+  let cancelReplacement = null;
 
   function runtime() {
     const id = global.ComposeRuntime ? ComposeRuntime.value() : 'pi';
@@ -37,6 +39,59 @@
   }
   const cloud = () => global.ComposeRuntime?.location?.() === 'cloud';
   const deviceLocal = model => model?.localOnly === true || String(model?.name || '').startsWith('local:');
+  const usable = model => model && model.available !== false && model.unavailable !== true &&
+    !/^(?:unavailable:|local:unavailable$)/.test(String(model.name || '')) && (!deviceLocal(model) || !cloud());
+
+  function textChoice(model) {
+    return { name: model.name, source: deviceLocal(model) ? 'local' : 'hub', provider: model.providerId || '' };
+  }
+
+  function matchesChoice(choice, candidate) {
+    return choice.name === candidate.name && choice.source === candidate.source &&
+      (!choice.provider || choice.provider === candidate.provider);
+  }
+
+  function uniqueTextChoice(choice, models) {
+    const matches = models.filter(model => model.name === choice.name);
+    return matches.length === 1 && matchesChoice(choice, textChoice(matches[0]));
+  }
+
+  function supportsTextModel(target, model) {
+    // All local managed Agents obtain Hub models through ai-proxy/config.
+    // Device models bypass that proxy. Remote runners supply their own adapters.
+    if (!cloud() && !deviceLocal(model) && model.providerKind && model.providerKind !== 'openai-compat') return false;
+    if (cloud() && ['codex-harness', 'qwen'].includes(target.id) && model.providerKind === 'anthropic') return false;
+    return cloud() || target.id !== 'pi' || model.capabilityProfile?.streaming?.state !== 'unsupported';
+  }
+
+  function selectReplacement(target, currentLabel, candidates) {
+    if (!document.createElement || !candidates.length) return Promise.resolve(null);
+    cancelReplacement?.();
+    const dialog = document.createElement('dialog');
+    dialog.className = 'app-confirm-dialog cp-switch-model';
+    dialog.setAttribute('aria-label', tx('当前模型无法用于目标底座'));
+    dialog.innerHTML = '<form method="dialog" class="app-confirm-card"><b class="app-confirm-title">' +
+      escape(tx('当前模型无法用于目标底座')) + '</b><p class="app-confirm-message"></p><label>' +
+      escape(tx('切换后使用')) + '<select required></select></label><footer class="app-confirm-foot">' +
+      '<button type="button" class="app-confirm-cancel">' + escape(tx('取消')) + '</button>' +
+      '<button type="submit" class="app-confirm-submit">' + escape(tx('使用此模型并切换')) + '</button></footer></form>';
+    dialog.querySelector('p').textContent = currentLabel + ' → ' + (target.displayName || target.id);
+    const list = dialog.querySelector('select');
+    candidates.forEach((item, index) => {
+      const option = document.createElement('option');
+      option.value = String(index);
+      option.textContent = [...new Set([item.label, item.provider, item.name].filter(Boolean))].join(' · ');
+      list.append(option);
+    });
+    return new Promise(resolve => {
+      const finish = value => { cancelReplacement = null; dialog.remove(); resolve(value); };
+      cancelReplacement = () => finish(null);
+      dialog.querySelector('form').onsubmit = event => { event.preventDefault(); finish(candidates[list.selectedIndex]); };
+      dialog.querySelector('.app-confirm-cancel').onclick = cancelReplacement;
+      dialog.oncancel = event => { event.preventDefault(); finish(null); };
+      document.body.append(dialog); dialog.showModal(); list.focus();
+    });
+  }
 
   function loadContext(row = runtime()) {
     // This public scope contains Hub/device/account identifiers, never tokens.
@@ -48,6 +103,11 @@
     const key = (cloud() ? 'cloud:' : 'local:') + String(id || 'pi');
     if (!states.has(key)) states.set(key, { modelName: '', reasoningEffort: '', thinkingLevel: '', modelChosen: false });
     return states.get(key);
+  }
+
+  function protectedSelection(selected) {
+    return selected.directoryPreference || selected.carriedChoice ||
+      (selected.modelChosen && Boolean(global.ComposeRuntime?.pendingSelection?.()));
   }
 
   function escape(value) {
@@ -102,9 +162,13 @@
     if (row.modelMode !== 'managed') return;
     const selected = state(row.id);
     selected.catalogUnavailable = false;
-    const chatMatch = enterpriseModels.some((item) => item.name === selected.modelName);
+    const chatMatch = enterpriseModels.find((item) => item.name === selected.modelName);
     const imageMatch = !cloud() && row.id === 'pi' && imageModels.some((item) =>
       global.SoduWorkModelChoice && SoduWorkModelChoice.imageKey(item) === selected.modelName);
+    if (chatMatch && selected.choice && (!uniqueTextChoice(selected.choice, enterpriseModels) ||
+        selected.carriedChoice && !supportsTextModel(row, chatMatch))) {
+      selected.unavailable = true; return;
+    }
     if (!chatMatch && !imageMatch) {
       const localSelection = deviceLocal({ name: selected.modelName }) ||
         global.SoduWorkModelChoice?.imageChoice(selected.modelName)?.name.startsWith('local:');
@@ -115,7 +179,7 @@
       }
       // A directory preference is a pair. Keep a missing saved model visible
       // until the user explicitly chooses a replacement instead of sending with a fallback.
-      if (selected.directoryPreference) { selected.unavailable = true; return; }
+      if (protectedSelection(selected)) { selected.unavailable = true; return; }
       const available = enterpriseModels.map(item => item.name);
       if (!cloud() && row.id === 'pi' && global.SoduWorkModelChoice) {
         available.push(...imageModels.map(item => SoduWorkModelChoice.imageKey(item)));
@@ -124,7 +188,7 @@
       // device-owned models first. Valid current choices stay unchanged.
       const next = available[0];
       selected.unavailable = !next;
-      if (next) { selected.modelName = next; selected.modelChosen = false; }
+      if (next) { selected.modelName = next; selected.modelChosen = false; delete selected.choice; }
       selected.thinkingLevel = '';
     } else selected.unavailable = false;
   }
@@ -201,6 +265,7 @@
     const thinkingOn = canThink && (!canDisable || (selected.thinkingLevel && selected.thinkingLevel !== 'off'));
     const rows = enterpriseModels.map((item) => ({
         name: item.name,
+        provider: item.providerId || '',
         label: item.label || item.name,
         sub: [item.providerName ? tx(item.providerName) : '', item.providerKind === 'anthropic' ? 'Anthropic' :
           item.providerKind === 'openai-compat' ? tx('OpenAI 兼容') : '',
@@ -210,6 +275,8 @@
       name: SoduWorkModelChoice.imageKey(item), label: item.label || item.name,
       sub: [tx('生成图片'), item.providerName ? tx(item.providerName) : '', item.keyFrom === 'mine' ? tx('自己的额度') : ''].filter(Boolean).join(' \u00b7 '),
     })));
+    const isSelected = item => item.name === selected.modelName &&
+      (!selected.choice?.provider || item.provider === selected.choice.provider);
     const thinkingLabel = !canThink
       ? '\u5f53\u524d\u6a21\u578b\u4e0d\u63d0\u4f9b\u53ef\u63a7\u601d\u8003'
       : (!canDisable ? '\u5df2\u5f00\u542f \u00b7 \u6a21\u578b\u56fa\u5b9a\u601d\u8003'
@@ -223,8 +290,9 @@
       '<button type="button" class="cp-thinking-switch" role="switch" aria-checked="' + (thinkingOn ? 'true' : 'false') + '" data-thinking-toggle' + (canThink && canDisable ? '' : ' disabled') + '><span></span><em class="sr-only">\u5207\u6362\u601d\u8003\u6a21\u5f0f</em></button></div>';
     return heading(runtime().id === 'pi' && imageModels.length ? '对话与图片模型 · 用于本次会话' : '用于本次会话') +
       '<div class="cp-model-scroll">' + rows.map((item) =>
-        '<button type="button" class="cp-mrow' + (item.name === selected.modelName ? ' on' : '') +
-          '" aria-pressed="' + (item.name === selected.modelName) + '" data-model="' + escape(item.name) + '">' + check() +
+        '<button type="button" class="cp-mrow' + (isSelected(item) ? ' on' : '') +
+          '" aria-pressed="' + isSelected(item) + '" data-model="' + escape(item.name) +
+          '" data-provider="' + escape(item.provider || '') + '">' + check() +
           '<span class="cp-model-symbol" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="m10 3 2 5 5 2-5 2-2 5-2-5-5-2 5-2Z"/></svg></span><span class="cp-mtxt"><b>' + escape(item.label) + '</b>' +
             (item.sub ? '<i>' + escape(item.sub) + '</i>' : '') + '</span></button>').join('') +
       emptyList() + '</div>' + (!selected.modelName && enterpriseDefaultErrors[runtime().id]
@@ -395,24 +463,23 @@
 
   async function load(force, row, sequence, scope) {
     const current = () => sequence === loadSeq && scope === loadContext().key;
+    const prepared = preparedCatalog?.scope === scope ? preparedCatalog.response : null;
+    preparedCatalog = null;
     if (cloud() && row.modelMode === 'account') return render();
     if (row.modelMode === 'managed') {
       if (enterpriseLoaded && !force) { render(); notify(); return; }
       try {
-        const response = global.SoduWorkAPI && SoduWorkAPI.myModels
-          ? await SoduWorkAPI.myModels({ localDefaults: !cloud() }) : null;
+        const response = prepared || await global.SoduWorkAPI?.myModels?.({ localDefaults: !cloud() });
         if (!current()) return;
         if (!response || response.ok === false || !Array.isArray(response.usable)) throw Error('模型目录暂时不可用');
         // Device-owned connections can be paired with any local managed
         // runtime. Cloud execution must never receive their private references.
-        const usable = model => model && model.available !== false && model.unavailable !== true &&
-          !/^(?:unavailable:|local:unavailable$)/.test(String(model.name || ''));
-        enterpriseModels = response.usable.filter(model => usable(model) && (!deviceLocal(model) || !cloud()))
+        enterpriseModels = response.usable.filter(usable)
           .sort((a, b) => Number(deviceLocal(b)) - Number(deviceLocal(a)));
         enterpriseDefaultErrors = response?.defaultModelErrors || {};
         managedCatalogUnavailable = response.managedCatalogUnavailable === true;
         imageModels = Array.isArray(response?.mediaUsable?.image)
-          ? response.mediaUsable.image.filter(model => usable(model) && (!deviceLocal(model) || !cloud())) : [];
+          ? response.mediaUsable.image.filter(usable) : [];
         clearStaleManagedSelection(row);
         enterpriseLoaded = true;
       } catch (error) {
@@ -427,16 +494,16 @@
       if (nativeLoaded === row.id && !force) return render();
       try {
         const bridge = api();
-        const response = bridge && typeof bridge.runtimeModels === 'function'
-          ? await bridge.runtimeModels(row.id) : null;
+        const response = prepared || await bridge?.runtimeModels?.(row.id);
         if (!current()) return;
         if (!response?.ok || !Array.isArray(response.models)) throw Error('模型目录暂时不可用');
         nativeModels = response.models;
         const selected = state(row.id);
-        if (nativeModels.length && !modelById(selected.modelName) && !selected.directoryPreference) {
+        const protectedChoice = protectedSelection(selected);
+        if (nativeModels.length && !modelById(selected.modelName) && !protectedChoice) {
           selected.modelName = (modelById(response.defaultModel) || nativeModels[0]).id;
         }
-        selected.unavailable = Boolean(selected.directoryPreference && !modelById(selected.modelName));
+        selected.unavailable = Boolean(protectedChoice && !modelById(selected.modelName));
         reconcileEffort(state(row.id));
         nativeReason = String(response && response.reason || '');
         nativeLoaded = row.id;
@@ -449,13 +516,19 @@
     }
   }
 
-  function chooseModel(id) {
+  function chooseModel(id, provider) {
     global.ComposeDirectoryPreferences?.selectionCommitted?.();
     const row = runtime();
     const selected = state(row.id);
     selected.modelChosen = true;
     selected.unavailable = false;
+    selected.catalogUnavailable = false;
+    selected.carriedChoice = false;
     selected.modelName = String(id || '');
+    const chatModel = enterpriseModels.find(item => item.name === id && (!provider || provider === item.providerId));
+    selected.choice = row.modelMode === 'account' ? { source: row.id, name: id }
+      : chatModel ? textChoice(chatModel) : { source: 'image', name: id };
+    if (chatModel && !uniqueTextChoice(selected.choice, enterpriseModels)) selected.unavailable = true;
     if (row.id !== 'codex') {
       const picked = enterpriseModels.find(item => item.name === selected.modelName) ||
         (selected.modelName ? null : enterpriseModels[0]);
@@ -466,6 +539,75 @@
     if (row.id === 'codex') { reconcileEffort(selected); nativeView = 'effort'; searchQuery = ''; }
     render();
     notify();
+  }
+
+  async function switchCatalog(target, choice) {
+    let response, candidates;
+    if (target.modelMode === 'managed') {
+      response = await global.SoduWorkAPI?.myModels?.({ localDefaults: !cloud() });
+      const hubImage = choice.source === 'image' && !global.SoduWorkModelChoice?.imageChoice(choice.name)?.name.startsWith('local:');
+      if (!Array.isArray(response?.usable) || response.ok === false ||
+          response.managedCatalogUnavailable && (choice.source === 'hub' || hubImage)) {
+        return null;
+      }
+      const models = response.usable.filter(usable);
+      const names = new Set(), duplicates = new Set();
+      for (const model of models) {
+        if (names.has(model.name)) duplicates.add(model.name);
+        names.add(model.name);
+      }
+      candidates = models.filter(model => !duplicates.has(model.name) && supportsTextModel(target, model)).map(model => ({
+        ...textChoice(model), label: model.label || model.name,
+      }));
+      if (!cloud() && target.id === 'pi' && global.SoduWorkModelChoice) {
+        for (const model of (response.mediaUsable?.image || []).filter(usable)) candidates.push({
+          name: SoduWorkModelChoice.imageKey(model), source: 'image', label: model.label || model.name,
+        });
+      }
+    } else if (target.id === 'codex' && !cloud()) {
+      response = await api()?.runtimeModels?.(target.id);
+      if (!response?.ok || !Array.isArray(response.models)) return null;
+      candidates = response.models.map(model => ({ source: target.id, name: model.id, label: model.label || model.id }));
+    }
+    if (!candidates || target.modelMode === 'account' && !candidates.length) {
+      candidates = [{ source: 'account', name: '', label: tx('使用底座账号默认模型') }];
+    }
+    return { response, candidates };
+  }
+
+  // The caller commits this prepared model and its Agent in one turn. Until
+  // then the input, its capabilities and its current model stay together.
+  async function prepareRuntimeSwitch(target, isCurrent, say = () => {}) {
+    const source = runtime(), selected = state(source.id);
+    if (source.id === target.id || !selected.modelChosen || !selected.choice) return;
+    const choice = selected.choice, scope = loadContext().key;
+    const current = () => isCurrent() && scope === loadContext().key && state(source.id).choice === choice;
+    let catalog = await switchCatalog(target, choice);
+    if (!current()) return false;
+    if (!catalog) { say(tx('模型目录暂时不可用')); return false; }
+    const { candidates } = catalog;
+    let next = candidates.find(candidate => matchesChoice(choice, candidate));
+    const preservesModel = Boolean(next);
+    if (!next) {
+      if (!candidates.length) { say(tx('目标底座没有可明确选择的可用模型')); return false; }
+      next = await selectReplacement(target, currentLabel(source, selected), candidates);
+      if (!next || !current()) return false;
+      catalog = await switchCatalog(target, next);
+      if (!current()) return false;
+      if (!catalog?.candidates.some(candidate => matchesChoice(next, candidate))) {
+        say(tx('原模型已不可用，请重新选择')); return false;
+      }
+    }
+    return {
+      preservesModel,
+      apply() {
+        const dest = state(target.id);
+        if (dest.modelName !== next.name) { dest.thinkingLevel = ''; dest.reasoningEffort = ''; }
+        Object.assign(dest, { modelName: next.name, modelChosen: Boolean(next.name), choice: next,
+          carriedChoice: Boolean(next.name), unavailable: false, catalogUnavailable: false });
+        preparedCatalog = { scope: loadContext(target).key, response: catalog.response };
+      },
+    };
   }
 
   function chooseEffort(value) {
@@ -568,7 +710,7 @@
       }
       const model = event.target.closest('[data-model]');
       if (model) {
-        chooseModel(model.getAttribute('data-model'));
+        chooseModel(model.getAttribute('data-model'), model.dataset?.provider);
         close();
         return;
       }
@@ -636,6 +778,7 @@
     const row = runtime();
     const context = loadContext(row);
     if (activeScope !== context.key) {
+      cancelReplacement?.();
       if (activeOwner && activeOwner !== context.owner) states.clear();
       activeOwner = context.owner;
       activeScope = context.key;
@@ -696,6 +839,8 @@
   }
 
   function resetSelection(localOnly) {
+    cancelReplacement?.();
+    preparedCatalog = null;
     if (localOnly) {
       for (const key of states.keys()) if (key.startsWith('local:')) states.delete(key);
     } else states.clear();
@@ -717,6 +862,7 @@
     selected.thinkingLevel = String(saved.thinkingLevel || '');
     selected.directoryPreference = true;
     selected.modelChosen = false;
+    delete selected.choice; delete selected.carriedChoice;
     if (row.modelMode === 'managed') {
       if (!enterpriseLoaded) { selected.unavailable = true; render(); notify(); return false; }
       clearStaleManagedSelection(row);
@@ -732,7 +878,8 @@
     for (const selected of states.values()) delete selected.directoryPreference;
   }
 
-  global.ComposeModelPicker = { bind, close, refresh, ready, value, resetNewDraft, resetDirectory, restoreSelection, releasePreference,
+  global.ComposeModelPicker = { bind, close, refresh, ready, value, prepareRuntimeSwitch, resetNewDraft, resetDirectory, restoreSelection, releasePreference,
+    hasManualChoice: () => state(runtime().id).modelChosen,
     nativeEffort: { html: effortCard, paint: paintEffortCard, levels: effortChoices, defaultLevel: defaultEffort },
     label: () => currentLabel(runtime(), state(runtime().id)) };
   const scopeChanged = () => {

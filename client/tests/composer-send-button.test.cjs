@@ -43,6 +43,18 @@ test('running chats keep one primary action and turn it into stop even with a dr
   window.ChatTools.paintSendButton(null, true, null);
 });
 
+test('repainting a saved draft keeps send disabled in view-only history until the next editable chat', () => {
+  const input = { disabled: true, value: 'Unsent draft' };
+  const send = { classList: { toggle() {} }, setAttribute() {} };
+  const root = { querySelector: selector => selector === '#nchatSend' ? send : input };
+  window.ChatTools.paintSendButton(root, false, null);
+  assert.equal(send.disabled, true);
+  assert.equal(input.value, 'Unsent draft');
+  input.disabled = false;
+  window.ChatTools.paintSendButton(root, false, null);
+  assert.equal(send.disabled, false);
+});
+
 test('stop states stay on the same single primary button', () => {
   const classes = new Set();
   const send = { disabled: false, attrs: {}, title: '', innerHTML: '', classList: {

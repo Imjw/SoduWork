@@ -6,6 +6,32 @@ Command examples use `sh start.sh` on macOS/Linux. On Windows, use `.\start.cmd`
 
 Hub provides identity, authorization, execution governance, plugins, shared materials, and desktop connectivity. It uses FastAPI and asynchronous SQLAlchemy with PostgreSQL; local development can use SQLite.
 
+## Direct device identity
+
+During authenticated sign-in or enrollment, `POST /api/v1/client-auth/peer-identity` registers a P-256 public key and issues a 30-minute mutual TLS certificate. The desktop encrypts the private key using system-protected storage. Hub binds the account, device and registered application role. Schema revision `0093_device_peer_identity` preserves this binding across changes to editable platform metadata and refuses a downgrade that would discard enrolled keys.
+
+HKDF derives a separate certificate authority for peer credentials using the configured `HUB_PUBLIC_URL`. Clients acquire its public certificate during authenticated HTTPS sign-in. Isolated source development also supports loopback HTTP. Rotating `AUTH_SECRET` or changing the public Hub URL changes this authority. A registration or secure-storage failure preserves the existing private key.
+
+The receiving desktop explicitly enables a listener and accepts a short-lived pairing request. Both peers verify the account, registered role, certificate and TLS public key locally. Desktop peers on the same account must both be online for a transfer and require approval for each transfer. Cross-device browsing and continuation are available to a paired mobile client on its selected desktop. Pairing information, addresses, conversation history and execution grants travel directly between peers. The repository supplies the desktop service for this protocol.
+
+Local sign-out or an account change invalidates current direct requests. Offline peers can continue to accept previously issued certificates until expiry. Renewal requires authenticated sign-in or enrollment. Run `python3 -m unittest test_device_peer_identity test_integrated_migration_history` for certificate and database migration checks. The desktop transport tests use real loopback TLS with synthetic identities.
+
+## Model proxy usage observations
+
+For a limited reconciliation run, upgrade the Hub database as described under Database configuration,
+set `PROXY_USAGE_SHADOW_ENABLED=true` and restart Hub. The default is false.
+The Chat Completions and Responses routes record upstream token evidence in
+`proxy_usage_observation`. Group by protocol, provider, model, agent, funding and
+evidence status. Compare only reported counts. Missing receipts are unknown;
+contradictory counts are conflicts. Outcome describes proxy transport completion.
+The provider response ID is hashed for matching. Model messages and keys are excluded.
+
+These observations are best effort and have no effect on quotas or the usage dashboard.
+The scope is requests through the two proxy routes. Direct Runner calls, separate
+vision calls and device-only models are outside this sample. A disconnect, oversized
+stream event or failed observation write can leave a gap. Disable the flag and
+restart after sampling; existing rows remain available for comparison.
+
 ## Start locally
 
 For a first session, use `sh start.sh` from the repository root; it creates an isolated database, environment, and administrator.
@@ -252,6 +278,12 @@ matching application before upgrading.
 
 ## Database configuration
 
+Run `alembic upgrade head` from the backend directory. The single Alembic head,
+`0094_merge_proxy_peer_identity`, merges `0093_proxy_usage_shadow` and
+`0093_device_peer_identity`. From either revision, Alembic applies the missing
+revision and then the merge. Existing proxy observations and enrolled peer keys
+are preserved.
+
 Domain ordering accepts signed 32-bit integers and legacy decimal strings.
 Malformed values, booleans, fractions and overflow return HTTP 400 before any
 record is changed. Omitting a rank or sending null keeps the existing rank on
@@ -310,7 +342,7 @@ Run `SODUWORK_TEST_OPENCODE_BIN=/absolute/path/to/opencode python3 -m unittest t
 
 ## OpenCode turn completion
 
-Native and ACP OpenCode executions preserve the current turn's provider finish reason. An output-token limit is reported as incomplete even when partial text exists and the native process exits successfully; existing progress and the session remain available for manual continuation. The ACP adapter observes only native session/turn identifiers and stop reasons through an invocation-local plugin, and rejects missing completion evidence without retrying tools or changing permissions. Run `python3 e2e_opencode_turn_outcome.py --binary /path/to/opencode` for isolated loopback-provider acceptance using an explicitly selected installed binary.
+Native and ACP OpenCode executions preserve the current turn's provider finish reason. An output-token limit is reported as incomplete even when partial text exists and the native process exits successfully; existing progress and the session remain available for manual continuation. The ACP adapter observes native session/turn identifiers, stop reasons and settled token counts through an invocation-local plugin, and rejects missing completion evidence without retrying tools or changing permissions. Run `python3 e2e_opencode_turn_outcome.py --binary /path/to/opencode` for isolated loopback-provider acceptance using an explicitly selected installed binary.
 
 ## OpenCode installation and network diagnostics
 
@@ -348,7 +380,11 @@ The check verifies the packaged native verifier, real TLS with a disposable trus
 
 Disabling an account invalidates its existing device sessions and AI/tool tickets, returns devices to pending sign-in, and closes their event, terminal and Runner channels. Device keys, configuration and historical ownership are retained. Another active account can sign in on the same device; re-enabling the original account requires a new sign-in and never restores old sessions. Explicit administrator device bans remain revoked and block every account. Devices already revoked by older account-disable behavior require an administrator to review and activate them; account re-enablement does not automatically lift device bans.
 
-Account conversation directory and source projections include `contentLocation`: `hub` for legacy Hub content, `source` for content retained by the original endpoint, `replica` for a valid migrated copy at the current source revision, or `unknown` when the reference cannot be established. The field does not expose private replica identifiers or grant access; clients must retain existing account, Hub, and execution checks. An unknown location must not be used to discard a potentially independent local copy.
+PC history and its directory belong to the owning device. The retired `POST /api/v1/account-conversations/sync` returns HTTP 410 with `LOCAL_CONVERSATION_SYNC_DISABLED`. Access to retained legacy titles, messages, lifecycle operations and change notifications requires the original account and device. Explicit recovery delivers old Hub archives to that device. The old branch route returns HTTP 410. A user can still explicitly hand a conversation to a cloud environment. The Hub rejects legacy endpoint history reads before contacting a desktop, and plugin receipts contain only plugin data. Cloud conversations and verified cloud project members remain shared with authorized devices on the account.
+
+Legacy `personal-conversation-relay` lookup, creation and claim routes return HTTP 410. Compatibility polls return an empty result, including for requests prepared before upgrade. Authorized historical receipts can still be reconciled. When the original PC explicitly imports an old Hub archive, the server accepts a fixed receipt containing the identity, checksum and size.
+
+Source-device legacy directory and source projections include `contentLocation`: `hub` for legacy Hub content, `source` for content retained by the original endpoint, `replica` for a valid migrated copy at the current source revision, or `unknown` when the reference cannot be established. The field does not expose private replica identifiers or grant access; clients must retain existing account, Hub, and execution checks. An unknown location must not be used to discard a potentially independent local copy.
 
 See [OAuth deployment and validation](CONNECTOR_OAUTH.en.md) for connector credentials and authorization.
 

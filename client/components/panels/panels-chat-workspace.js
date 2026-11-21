@@ -196,10 +196,19 @@
     return kind === 'web' || kind === 'pdf';
   }
   function canAutoPreview(file) {
-    const kind = previewKind(file);
     // Automatic output handling stays inside the right pane. Other results
     // remain conversation cards until the user chooses an explicit file action.
-    return kind !== 'external' && (kind !== 'pdf' || Boolean(file?.path));
+    return !WB.historyPreview && !requiresExternalOpen(file, previewKind(file));
+  }
+  function requiresExternalOpen(file, kind) {
+    return kind === 'external' || (kind === 'pdf' && !(WB.historyPreview ? file.artifactId : file.path));
+  }
+  async function openExternalFile(file) {
+    const current = previewOwner();
+    try {
+      const reply = await artifactRequest(sessionApi(), context().ref, file, 'open');
+      if (reply?.ok === false) throw Error(reply.reason || '文件暂时不可用');
+    } catch (error) { if (current()) global.petSay?.(error.message || '文件暂时不可用'); }
   }
   function openPendingCloud(file, activate = true, automatic = false) {
     if (!file?.cloudPending || !links?.materialize) return false;
@@ -272,8 +281,8 @@
     const id = fileKey(file);
     if (!id) return null;
     const kind = previewKind(file);
-    if (kind === 'external' || (kind === 'pdf' && !file.path)) {
-      artifactRequest(sessionApi(), context().ref, file, 'open');
+    if (requiresExternalOpen(file, kind)) {
+      void openExternalFile(file);
       return null;
     }
     const change = fileChangeFor(file);
@@ -296,8 +305,8 @@
     if (isTaskPreview(file)) { openTaskPreview(file, true); return true; }
     if (openTaskOutput(file)) return true;
     const kind = previewKind(file);
-    if (kind === 'external' || (kind === 'pdf' && !file.path)) {
-      artifactRequest(sessionApi(), context().ref, file, 'open');
+    if (requiresExternalOpen(file, kind)) {
+      void openExternalFile(file);
       return true;
     }
     WB.manualClosed = false;
@@ -308,7 +317,7 @@
     return true;
   }
   function linkTarget(value, files) {
-    const file = links && links.fileTarget(value, files);
+    const file = WB.historyPreview ? links?.workspaceFileTarget(value, files) : links?.fileTarget(value, files);
     if (file) return { kind: 'file', file };
     const raw = String(value || '').trim();
     if (!raw || raw.startsWith('#')) return null;
@@ -450,6 +459,10 @@
         label: file.name, file, view: hasImages ? 'preview' : 'code', autoPreview: false }, true);
       paint();
       return true;
+    }
+    if (WB.historyPreview) {
+      const recorded = links.workspaceFileTarget(value, WB.files);
+      return recorded?.artifactId ? openOutput(recorded.artifactId) : false;
     }
     let file = WB.files.find((item) => {
       const names = [item.path, item.relative, item.name].map(normalizedPath).filter(Boolean);
@@ -596,6 +609,7 @@
       }).join('') + '</div>' : '<div class="ncw-files-empty">本次对话还没有可查看的文件。</div>') + '</section>';
   }
   function libraryUploadButton(file) {
+    if (WB.historyPreview) return '';
     return global.LibraryTransfer?.button(file, context().ref, 'data-wb-library-upload') || '';
   }
 
@@ -632,7 +646,7 @@
       slot.setAttribute('data-native-preview-tab', tab.id);
       if (!tab.nativeReady) {
         if (tab.reloadNative) payload.reload = true;
-        if (tab.kind === 'web' && tab.file.artifactId) {
+        if ((tab.kind === 'web' || (WB.historyPreview && tab.kind === 'pdf')) && tab.file.artifactId) {
           Object.assign(payload, { kind: 'artifact', artifactId: tab.file.artifactId });
         } else if (tab.kind === 'web' || tab.kind === 'pdf') {
           Object.assign(payload, { kind: 'file', target: tab.file.path });
@@ -773,6 +787,7 @@
   }
   function renderWorkbench(root, snapshot, files) {
     WB.root = root; ensure(root);
+    WB.historyPreview = snapshot?.localReplica === true;
     const turnTools = currentTurnTools(snapshot || {});
     const nextChanges = changes(turnTools);
     WB.fileChanges = info.currentWorkJournal(snapshot);
@@ -891,6 +906,7 @@
   }
   function resetWorkbench() {
     const previousRoot = WB.root;
+    WB.historyPreview = false;
     WB.tabs.forEach(tab => tab.dispose?.());
     if (WB.frame) (global.cancelAnimationFrame || clearTimeout)(WB.frame);
     WB.nativeRequest++;

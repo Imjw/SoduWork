@@ -426,6 +426,8 @@
         '<button type="button" class="wc-more-row" id="nchatMoreGoal" disabled>' +
           '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7.5"/><circle cx="12" cy="12" r="3"/><path d="M12 2v3M22 12h-3M12 22v-3M2 12h3"/></svg>' +
           '<span><b>设定目标</b><i>请在新对话发送前设置</i></span></button>' +
+        '<button type="button" class="wc-more-row" data-device-direct-transfer>' + ICONS.folder +
+          '<span><b>迁移到本人设备</b><i>选择本次内容并由接收电脑确认</i></span></button>' +
       '</div></span>';
     const context = `<div class='wc-context' id='nchatContext'>` +
       contextButton({ id: 'nchatMode', valueId: 'nchatModeName', icon: 'shield',

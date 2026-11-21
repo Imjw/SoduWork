@@ -10,7 +10,7 @@ from ..models import Task, TaskEvent, Attachment, User, AiScheduleRun
 KINDS = ("account", "handoff", "message", "relay", "execution", "schedule")
 
 
-def query(kind, owner=None):
+def query(kind, owner=None, *, source_client_id=None):
     if kind == "account":
         model = AccountConversation
         body = select(AccountConversationMessage.id).where(AccountConversationMessage.conversation_id == model.id,
@@ -45,13 +45,15 @@ def query(kind, owner=None):
         account = model.owner_user_id
     else:
         raise HTTPException(422, "迁移类别无效")
+    if kind in {"account", "relay"} and source_client_id is not None:
+        statement = statement.where(model.source_client_id == source_client_id)
     return model, statement.where(account == owner) if owner is not None else statement
 
 
-async def counts(session, owner=None):
+async def counts(session, owner=None, *, source_client_id=None):
     result = {}
     for kind in KINDS:
-        _, statement = query(kind, owner)
+        _, statement = query(kind, owner, source_client_id=source_client_id)
         result[kind] = await session.scalar(select(func.count()).select_from(statement.subquery()))
     return result
 

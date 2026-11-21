@@ -188,6 +188,17 @@ test('failed source synchronization blocks execution', async t => {
   await f.service.tick(); assert.equal(f.sends(), 0); assert.equal(f.job.phase, 'rejected');
 });
 
+test('retired account synchronization cannot authorize execution from stale checkpoints', async t => {
+  const f = fixture(t, { override: { sync: async () => ({ ok: true, disabled: true }) } });
+  await f.service.tick();
+  assert.equal(f.sends(), 0);
+  assert.equal(f.job.phase, 'rejected');
+  // The protocol claims the receipt before acknowledging rejection; it must
+  // never advance to the native send or leave a prepared command for replay.
+  assert.deepEqual(f.calls.map(([route]) => route), ['poll', 'claims/' + f.job.id, 'acks/' + f.job.id]);
+  assert.match(f.acks[0].reason, /账号同步已停用/);
+});
+
 test('parallel polls share a single admission operation', async t => {
   const f = fixture(t);
   await Promise.all([f.service.tick(), f.service.tick(), f.service.tick()]);

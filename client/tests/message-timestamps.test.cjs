@@ -150,6 +150,8 @@ test('goal final archive keeps its saved completion time instead of reopening ti
   assert.equal(acc.snapshot().messages.at(-1).completedAt, end);
 });
 test('Runner initial dispatch persists the optimistic send time separately from processing time', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'soduwork-runner-dispatch-clock-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   let payload;
   const adapter = createRunnerRuntimeAdapter({
     modelConfig: { fetchModel: async () => ({ ok: true, model: { id: 'fixture', key: 'fixture' } }) },
@@ -159,7 +161,7 @@ test('Runner initial dispatch persists the optimistic send time separately from 
       return { ok: true, data: {} };
     } }
   });
-  const session = await adapter.createSession({ native: { runner: { openOptions: { cwd: os.tmpdir(), ref: 'timed-dispatch' } } } });
+  const session = await adapter.createSession({ native: { runner: { openOptions: { cwd: root, ref: 'timed-dispatch' } } } });
   t.after(() => session.dispose());
   await session.send({ text: 'initial', options: { sentAt: start } }).completion;
   assert.equal(payload.ctx.conversationSentAt, start);

@@ -56,6 +56,20 @@ class LocalRpcTests(unittest.IsolatedAsyncioTestCase):
         machine._drop_message_transfers = AsyncMock()
         return machine
 
+    async def test_image_receipts_run_on_the_local_query_lane_with_the_runner_store(self):
+        server = self.create(self.runner()._local_rpc_dispatch)
+        request = {"op": "runtime.history.imageReceipts", "ref": "synthetic-local-chat",
+                   "revision": 4, "calls": [{"callId": "read-1", "path": "/synthetic.png"}]}
+        receipt = {"ref": request["ref"], "revision": 4, "callIds": ["read-1"]}
+        with patch("app.services.local_base._STORE", "/trusted/runner/local-runs"), \
+                patch("app.services.codex_image_history.lookup", return_value=receipt) as lookup:
+            await server.submit("lookup", request)
+            self.assertEqual((await self.reply("lookup"))["result"], {"ok": True, "data": receipt})
+            root, forwarded = lookup.call_args.args
+            self.assertEqual(root, "/trusted/runner/local-runs")
+            self.assertTrue(forwarded["_localParent"])
+            self.assertEqual(forwarded["calls"], request["calls"])
+
     async def test_slow_native_detection_does_not_block_other_session_status_or_stop(self):
         machine = self.runner()
         server = self.create(machine._local_rpc_dispatch)

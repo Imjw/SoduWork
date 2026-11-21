@@ -270,7 +270,7 @@ test('an observed replay cannot turn a retained genuine failure into a recoverab
   assert.equal(f.store.get(row.id).status, 'unreachable');
 });
 
-test('terminal outcome recovery requires the current readable account and matching provenance', async t => {
+test('terminal outcome recovery requires the owning account even when another account can read the ordinary chat', async t => {
   const f = await fixture(t), row = f.rows[0];
   await f.history.register([{ ...row, state: 'failed', status: 'failed',
     creator: { account: 'one', hub: f.actor.hub }, runtimeUnavailable: true,
@@ -279,7 +279,7 @@ test('terminal outcome recovery requires the current readable account and matchi
       state: 'completed', status: 'idle' } }]);
   f.setIdentity(tokens.identity('two'));
   await f.history.projectRows(f.rows);
-  assert.deepEqual(await f.states(), []);
+  assert.ok((await f.states()).some(([id,state])=>id===row.id&&state==='failed'));
   assert.equal(f.store.get(row.id).state, 'failed');
   f.setIdentity(f.actor);
   await f.history.projectRows(f.rows);

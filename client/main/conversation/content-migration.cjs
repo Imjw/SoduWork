@@ -5,7 +5,10 @@
 const { fetchWithDeviceAuthRetry } = require('../device-auth-request');
 const { connectionScope } = require('../platform-connections/runtime.cjs');
 const KINDS = ['account', 'handoff', 'message', 'relay', 'execution', 'schedule'];
-function create({ app, identityOf, fetch = fetchWithDeviceAuthRetry, interval = 60000, budget = 20 }) {
+function create({ app, identityOf, fetch = fetchWithDeviceAuthRetry, interval = 60000, budget = 20,
+  includeAccountHistory = true }) {
+  // A desktop upgrade must not automatically download other PCs' legacy history.
+  const kinds = includeAccountHistory ? KINDS : KINDS.filter(kind => kind !== 'account');
   let closed = false, timer, pending, owner = '', state = { phase: 'idle' };
   let cursors = {};
   const lifetime = new AbortController();
@@ -35,9 +38,9 @@ function create({ app, identityOf, fetch = fetchWithDeviceAuthRetry, interval = 
       if (!status.metadataOnly) { state = { phase: 'waiting-upgrade', pending: status.pending }; return; }
       state = { phase: status.complete ? 'complete' : 'running', pending: status.pending, succeeded: 0, failed: 0 };
       let remaining = budget;
-      for (const kind of KINDS) {
+      for (const kind of kinds) {
         if (remaining <= 0 || !status.pending?.[kind]) continue;
-        const page = await request('?kind=' + kind + '&limit=' + Math.min(remaining, 50, Math.max(1, Math.floor(budget / KINDS.length))) +
+        const page = await request('?kind=' + kind + '&limit=' + Math.min(remaining, 50, Math.max(1, Math.floor(budget / kinds.length))) +
           '&after=' + encodeURIComponent(cursors[kind] || ''));
         if (!Array.isArray(page.items)) throw Error('Invalid migration directory');
         cursors[kind] = page.hasMore ? String(page.cursor || '') : '';

@@ -169,7 +169,7 @@ class CloudConversationTests(unittest.IsolatedAsyncioTestCase):
         runner.tags = [runner_hub.CLIENT_TAG]
         runner.caps = ["handoff1", "desktopCapabilities1", "desktopPluginTurn1", "desktopPluginStart1", "admit1"]
         async with db.SessionLocal() as session:
-            session.add(models.Client(id=runner.client_id, user_ref=self.fixture.owner.id, auth_state="active"))
+            session.add(models.Client(id=runner.client_id, user_ref=self.fixture.owner.id, auth_state="active", platform="darwin/arm64"))
             node = await session.get(RunnerNode, runner.id)
             node.client_id = runner.client_id
             await session.commit()

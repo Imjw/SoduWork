@@ -29,7 +29,7 @@ function fixture(options = {}) {
     taskInput: { request: async (_identity, route) => options.request(route) },
     app: options.app || { getPath: () => emptyStorage }, path,
     identityOf: options.identityOf || (async () => defaultIdentity),
-    memories: { context: async () => ({}),
+    memories: options.memories || { context: async () => ({}),
       attach: options.memoryAttach || (async () => {}), assertOwner() {} },
     pluginGrant: require('../main/pi-session/plugin-grant'),
     updateWorkloads: { guard: () => ({ ok: true }) },
@@ -84,6 +84,8 @@ function fixture(options = {}) {
       if (name === '../conversation/account-native-source.cjs') return require('../main/conversation/account-native-source.cjs');
       if (name === '../conversation/shared-history.cjs') return require('../main/conversation/shared-history.cjs');
       if (name === '../conversation/execution-outcome.cjs') return require('../main/conversation/execution-outcome.cjs');
+      if (name === '../conversation/device-local-continuation.cjs') return require('../main/conversation/device-local-continuation.cjs');
+      if (name === '../agent-runtime/switchable-conversation') return require('../main/agent-runtime/switchable-conversation');
       if (!['../native-locale.cjs', '../agent-runtime/runtime-catalog', '../access-control/policy', '../access-control/preferences', '../access-control/automation-access', '../platform-connections/runtime.cjs', '../conversation/history-access', '../conversation/requirement-context', '../conversation/acceptance-session', '../conversation/work-conversation-opening', '../conversation-connectors.cjs', './resume-cwd', './task-access'].includes(name)) throw Error('Unexpected dependency ' + name);
       return require(path.join(__dirname, '../main/pi-session', name));
     },
@@ -101,6 +103,216 @@ function automationIdentity(uid = 'owner') {
   const claims = Buffer.from(JSON.stringify({ typ: 'device', uid, cid: 'fixture', iat: now - 60, exp: now + 3600 })).toString('base64url');
   return { hub: 'http://fixture.invalid', clientId: 'fixture', session: claims + '.' + 'a'.repeat(64) };
 }
+
+test('history navigation reads the authorized transcript before credentials and an explicit continuation honors a new runtime', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sw-device-preview-'));
+  const app = { getPath: () => root }, a = automationIdentity(), b = automationIdentity('second');
+  const scope = require('../main/platform-connections/runtime.cjs').scope;
+  const id = 'normal-history', archive = path.join(root, 'pi-agent', 'sessions', 'fixture', id + '.jsonl');
+  const row = { id, adapterId: 'pi', path: archive, count: 2, at: 123456, cwd: root, workOwner: scope(a),
+    creator: { account: 'owner', hub: a.hub } };
+  fs.mkdirSync(path.dirname(archive), { recursive: true });
+  fs.writeFileSync(archive, [
+    { type: 'session', id },
+    { type: 'message', id: 'user', message: { role: 'user', content: 'original synthetic request' } },
+    { type: 'message', id: 'reply', message: { role: 'assistant', content: [
+      { type: 'text', text: 'saved answer' },
+      { type: 'toolCall', id: 'unconfirmed', name: 'read', arguments: {} }] } },
+  ].map(item => JSON.stringify(item)).join('\n'));
+  const session = { findBySessionId: () => null, historyEntry: async () => ({ ok: true, entry: row }) };
+  const history = require('../main/conversation/shared-history.cjs').create({ app, session, identityOf: () => b });
+  t.after(async () => { await history.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  t.mock.method(require('../main/conversation/requirement-context'), 'cachedIdentity', () => b);
+  await history.register([row]);
+  let credentials = 0, preview;
+  const f = fixture({ app, session, archive: row, identity: b,
+    identityOf: async () => { credentials++; return b; }, sharedHistory: history,
+    attachView(value) { preview = value; return value; },
+    openReply: handle => ({ ok: true, sessionId: handle.sessionId, snapshot: handle.uiSnapshot?.() }) });
+  const unfinished = await f.open({ chatId: id, historyIntent: 'view' });
+  assert.equal(unfinished.ok, true, unfinished.reason);
+  assert.equal(unfinished.snapshot.messages[0].text, 'original synthetic request');
+  assert.equal(unfinished.snapshot.execution.canContinueOnDevice, false);
+  assert.match(unfinished.snapshot.historyRecovery.reason, /回执/);
+  assert.equal(credentials, 0);
+  assert.equal(f.calls.length, 0);
+  const denied = await f.open({ chatId: id, historyIntent: 'continue', adapterId: 'qwen' });
+  assert.equal(denied.ok, false);
+  assert.match(denied.reason, /回执/);
+  assert.equal(f.calls.length, 0);
+  assert.equal(preview.snapshot().messages[1].text, 'saved answer');
+  const legacy = await f.open({ chatId: id });
+  assert.equal(legacy.ok, true, legacy.reason);
+  assert.equal(legacy.snapshot.execution.canContinueOnDevice, false);
+  assert.match(legacy.snapshot.historyRecovery.reason, /回执/);
+  assert.equal(f.calls.length, 0, 'Omitting the navigation intent cannot resume unconfirmed work');
+  fs.appendFileSync(archive, '\n' + JSON.stringify({ type: 'message', id: 'read-receipt',
+    message: { role: 'toolResult', toolCallId: 'unconfirmed', toolName: 'read', content: [{ type: 'text', text: 'verified result' }] } }));
+  const ready = await f.open({ chatId: id, historyIntent: 'view' });
+  assert.equal(ready.ok, true, ready.reason);
+  assert.equal(ready.snapshot.execution.canContinueOnDevice, true);
+  const started = await f.open({ chatId: id, historyIntent: 'continue', adapterId: 'qwen',
+    modelName: 'current-model', reasoningEffort: 'low' });
+  assert.equal(started.ok, true, started.reason);
+  const executed = f.calls.at(-1);
+  assert.equal(executed.adapterId, 'qwen');
+  assert.equal(executed.modelName, 'current-model');
+  assert.equal(executed.reasoningEffort, 'low');
+  assert.equal(executed.deviceHistoryRecovery.row.id, id);
+  assert.equal(executed.deviceHistoryRecovery.prefix.messages[0].text, 'original synthetic request');
+  assert.ok(executed.deviceHistoryRecovery.prefix.tools.some(tool => tool.state === 'done' && tool.result === 'verified result'));
+  assert.equal(executed.runtimeConversationId, '');
+  assert.equal(executed.resumePath, '');
+  assert.equal(executed.resumeCwd, '');
+  assert.equal(executed.resumeAt, row.at);
+  assert.equal(executed.accessPolicy.mode, 'standard');
+  assert.equal(f.calls.length, 1);
+  const original = fixture({ app, identity: a, archive: row, sharedHistory: { resolve: async () => row } });
+  const resumed = await original.open({ chatId: id });
+  assert.equal(resumed.ok, true, resumed.reason);
+  assert.equal(original.calls[0].resumeCwd, root);
+  assert.equal(original.calls[0].resumePath, archive);
+  assert.equal(original.calls[0].resumeAt, row.at);
+});
+
+test('a preview racing an account change is disposed before attachment and continuation cannot displace pending approval', async () => {
+  const a = automationIdentity(), b = automationIdentity('next');
+  const row = { id: 'switch-preview', adapterId: 'pi', localReplica: true,
+    creator: { account: 'owner', hub: a.hub }, workOwner: require('../main/platform-connections/runtime.cjs').scope(a) };
+  let current = a, disposed = 0;
+  const f = fixture({ cachedIdentity: () => current, sharedHistory: { resolve: async () => row,
+    open: async () => { current = b; return { close: async () => { disposed++; } }; } },
+    attachView: () => assert.fail('A stale preview must never enter the runtime registry') });
+  const stale = await f.open({ chatId: row.id, historyIntent: 'view' });
+  assert.equal(stale.ok, false);
+  assert.equal(disposed, 1);
+
+  const live = { sessionId: row.id, snapshot: () => ({ pendingPermissions: [{ id: 'prompt' }] }),
+    close: () => assert.fail('A pending approval must retain its original runtime') };
+  const active = fixture({ live, identity: a, sharedHistory: { resolve: async () => row,
+    prepareContinuation: async () => assert.fail('Pending approval must not start a new segment') } });
+  const reply = await active.open({ chatId: row.id, historyIntent: 'continue', adapterId: 'qwen' });
+  assert.equal(reply.ok, false);
+  assert.match(reply.reason, /执行或等待/);
+  assert.equal(active.calls.length, 0);
+});
+
+test('explicit continuation reuses the same idle runtime only after verifying its receipts and exact current selection', async () => {
+  const a = automationIdentity(), owner = require('../main/platform-connections/runtime.cjs').scope(a);
+  const row = { id: 'warm-selection', adapterId: 'pi', localReplica: true,
+    creator: { account: 'owner', hub: a.hub }, workOwner: owner };
+  let unresolved = false, checks = 0;
+  const live = { sessionId: row.id, ref: 'existing', adapterId: 'qwen',
+    usageIdentity: { accountScope: owner, hub: a.hub, clientId: a.clientId },
+    snapshot: () => ({ modelSelection: { name: 'available', activeName: 'available' },
+      thinking: { level: 'low' }, accessControl: { mode: 'readonly' } }),
+    close: () => assert.fail('An exact live selection must retain its native context') };
+  const history = { resolve: async () => row, async prepareContinuation(id, options) {
+    assert.equal(id, row.id); assert.equal(options.refresh, true); checks++;
+    if (unresolved) throw Object.assign(Error('missing receipt'), { code: 'HISTORY_UNRESOLVED_TOOLS' });
+    return { row };
+  } };
+  const f = fixture({ identity: a, live, sharedHistory: history, openReply: handle => ({ ok: true, ref: handle.ref }) });
+  const options = { chatId: row.id, historyIntent: 'continue', adapterId: 'qwen', modelName: 'available',
+    accessMode: 'readonly', reasoningEffort: 'low' };
+  const warm = await f.open(options);
+  assert.equal(warm.ok, true, warm.reason); assert.equal(warm.ref, live.ref);
+  unresolved = true;
+  const denied = await f.open(options);
+  assert.equal(denied.ok, false); assert.match(denied.reason, /missing receipt/);
+  assert.equal(checks, 2); assert.equal(f.calls.length, 0);
+  const matches = require('../main/conversation/device-local-continuation.cjs').matchesLiveSelection;
+  for (const changed of [{ modelName: '' }, { adapterId: 'pi' }, { accessMode: 'standard' }, { reasoningEffort: 'high' }])
+    assert.equal(matches(live, { ...options, ...changed }, a, owner), false);
+});
+
+test('a missing Runner directory entry needs a fresh authoritative receipt to recover through the legacy path', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sw-runner-missing-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const app = { getPath: () => root }, row = { id: 'runner-recovery', adapterId: 'qwen' };
+  const resolve = require('../main/conversation/native-history-opening.cjs').resolve;
+  const session = { archivedConversation: async () => null };
+  for (const status of ['missing', 'present', 'unavailable']) {
+    const history = { async prepareContinuation(id, options) {
+      assert.equal(id, row.id); assert.equal(options.refresh, true);
+      if (status === 'unavailable') throw Object.assign(Error('Runner archive access failed'), { code: 'NATIVE_HISTORY_UNAVAILABLE' });
+      return { row, historyRecovery: { nativeArchiveMissing: status === 'missing' } };
+    } };
+    const pending = resolve({ app, session, history, row });
+    if (status === 'missing') assert.equal((await pending).recovery.historyRecovery.nativeArchiveMissing, true);
+    else await assert.rejects(pending, { code: 'NATIVE_HISTORY_UNAVAILABLE' });
+  }
+});
+
+test('only a confirmed model or adapter failure can fall back to the owner’s protected transcript', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sw-owned-history-preview-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const app = { getPath: () => root }, a = automationIdentity();
+  const row = { id: 'owner-private', adapterId: 'pi', creator: { account: 'owner', hub: a.hub } };
+  require('../main/conversation/session-memory').bind(app, row.id, a, ['private-selection'], true);
+  for (const code of ['LOCAL_HISTORY_MODEL_UNAVAILABLE', 'RUNNER_MODEL_UNAVAILABLE', 'ADAPTER_NOT_FOUND', 'TASK_BINDING_MISMATCH']) {
+    let reads = 0;
+    const f = fixture({ app, identity: a, archive: row, openResult: { ok: false, runtimeError: code },
+      sharedHistory: { resolve: async () => row, open: async (_id, options) => {
+        assert.equal(options.allowContinuation, false);
+        assert.match(options.previewReason, /底座或模型/);
+        reads++;
+        return { localReplica: true, readOnly: true, sessionId: row.id };
+      } } });
+    const result = await f.open({ chatId: row.id, historyIntent: 'view' });
+    assert.equal(result.ok, code !== 'TASK_BINDING_MISMATCH');
+    assert.equal(reads, result.ok ? 1 : 0);
+  }
+});
+
+test('ordinary desktop chat skips automatic private memory on creation and reopen while explicit private chats retain it', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sw-desktop-private-context-'));
+  const a = automationIdentity(), b = automationIdentity('second'), app = { getPath: () => root };
+  const memory = require('../main/conversation/session-memory');
+  const local = require('../main/conversation/local-memory');
+  const access = require('../main/conversation/history-access');
+  const { scope } = require('../main/platform-connections/runtime.cjs');
+  const document = local.createPersonal({ app, owner: scope(a), title: 'Private', content: 'synthetic private memory' });
+  let organizationReads = 0;
+  t.mock.method(require('../main/conversation/organization-context'), 'context', async () => {
+    organizationReads++;
+    return { prompt: 'synthetic organization memory', items: [] };
+  });
+  const memories = memory.install({ app, ipcMain: { handle() {} }, identityOf: async () => a });
+  let current = a;
+  const history = require('../main/conversation/shared-history.cjs').create({
+    app, session: {}, identityOf: () => current,
+  });
+  t.after(async () => { await history.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const row = { id: 'ordinary', adapterId: 'pi', localReplica: true, count: 2, creator: { account: 'owner', hub: a.hub } };
+  const handle = { sessionId: row.id, close: async () => true };
+  const opens = fixture({ app, memories, identity: a, archive: row, openResult: { ok: true, session: handle },
+    sharedHistory: { resolve: async () => row } });
+  for (const options of [{ sidebarProjectId: 'local-folder' }, { chatId: row.id }]) {
+    const opened = await opens.open(options);
+    assert.equal(opened.ok, true, opened.reason);
+    assert.equal(organizationReads, 0);
+    assert.equal(handle.ui.memoryScopes.length, 0, 'No account memory learning is registered for a device chat');
+    assert.deepEqual(access.assertDeviceReadable(app, row.id, access.actor(app, b), row),
+      { sharedOnDevice: true, originalOwner: scope(a) });
+    assert.ok(!opens.calls.at(-1).contextPrompts.some(value => /synthetic/.test(value)));
+  }
+  const privateRow = { ...row, id: 'private' }, privateHandle = { ...handle, sessionId: privateRow.id };
+  const privateOpens = fixture({ app, memories, identity: a, archive: privateRow, openResult: { ok: true, session: privateHandle },
+    sharedHistory: { resolve: async () => privateRow } });
+  for (const options of [{ memoryIds: [document.item.id] }, { chatId: privateRow.id }]) {
+    const opened = await privateOpens.open({ ...options, deviceChatContext: true });
+    assert.equal(opened.ok, true, opened.reason);
+    assert.ok(privateOpens.calls.at(-1).contextPrompts.some(value => value.includes('synthetic private memory')));
+    assert.ok(privateHandle.ui.memoryScopes.length);
+    assert.throws(() => access.assertDeviceReadable(app, privateRow.id, access.actor(app, b), privateRow));
+  }
+  assert.equal(organizationReads, 2);
+  await history.register([row, privateRow]);
+  assert.deepEqual((await history.page()).chats.map(chat => chat.id).sort(), ['ordinary', 'private']);
+  current = b;
+  assert.deepEqual((await history.page()).chats.map(chat => chat.id), ['ordinary']);
+});
 
 test('a downloaded transcript cannot shadow the cloud original on repeated desktop opens', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sw-cloud-copy-open-'));
@@ -411,6 +623,7 @@ test('a stale account projection never falls through to the Agent registry', asy
 test('verified native archive ignores stale account flags on the sidebar row', async () => {
   const identity = automationIdentity();
   const local = {id: 'native-source', adapterId: 'pi', path: 'verified-archive',
+    localReplica: true, creator: { account: 'owner', hub: identity.hub },
     workOwner: require('../main/platform-connections/runtime.cjs').scope(identity)};
   const f = fixture({archive: local, sharedHistory: {resolve: async () => local},
     accountSync: {openProjection: async () => assert.fail('native history must not read an account projection') }});

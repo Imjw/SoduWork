@@ -6,7 +6,7 @@ const access = require('../main/conversation/history-access');
 const { identity } = require('./helpers/platform-session-fixture.cjs');
 const runtime = require('../main/platform-connections/runtime.cjs');
 
-function fixture(t) {
+function fixture(t, memoryIds = []) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sw-local-scope-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const app = { getPath: () => root }, a = identity(), b = identity('two');
@@ -17,17 +17,18 @@ function fixture(t) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, typeof value === 'string' ? value : JSON.stringify(value)); return file;
   };
-  const binding = save('session-memory-bindings', row.id, { owner: runtime.scope(a), ids: ['private-memory-a'] });
+  const binding = save('session-memory-bindings', row.id, { owner: runtime.scope(a), ids: memoryIds });
   return { app, root, a, b, row, save, binding, actor: value => access.actor(app, value) };
 }
 
-test('ordinary native data remains account and Hub scoped without changing private memory ownership', t => {
-  const f = fixture(t), before = fs.readFileSync(f.binding, 'utf8');
-  assert.equal(access.classifyLocal(f.app, f.row.id, f.row).kind, 'ordinary');
+test('native data with a private memory remains account and Hub scoped on the desktop', t => {
+  const f = fixture(t, ['private-memory-a']), before = fs.readFileSync(f.binding, 'utf8');
+  assert.equal(access.classifyLocal(f.app, f.row.id, f.row).kind, 'protected');
   assert.doesNotThrow(() => access.assertLocalMutation(f.app, f.row.id, f.actor(f.a), f.row));
   for (const actor of [f.b, { ...f.a, hub: 'https://other.invalid' }, null]) {
     assert.throws(() => access.assertLocalMutation(f.app, f.row.id, f.actor(actor), f.row));
     assert.throws(() => access.assertReadable(f.app, f.row.id, f.actor(actor), f.row));
+    assert.throws(() => access.assertDeviceReadable(f.app, f.row.id, f.actor(actor), f.row));
   }
   assert.doesNotThrow(() => access.assertLocalMutation(f.app, f.row.id, f.actor(f.a), f.row));
   assert.throws(() => access.assertOwner(f.app, f.row.id, f.actor(f.b), f.row), /账号/);
@@ -102,7 +103,7 @@ test('native registration cannot adopt a downloaded origin locator in either dis
 });
 
 test('a later conflicting requirement binding immediately revokes owner visibility without changing private memory', t => {
-  const f = fixture(t), before = fs.readFileSync(f.binding, 'utf8');
+  const f = fixture(t, ['private-memory-a']), before = fs.readFileSync(f.binding, 'utf8');
   assert.equal(access.visible(f.app, [f.row], f.a).length, 1);
   assert.equal(access.visible(f.app, [f.row], f.b).length, 0);
   f.save('requirement-session-context', f.row.id, { version: 1, owner: runtime.scope(f.b), hub: f.b.hub });
@@ -137,11 +138,14 @@ test('a protected parent also protects raw children before history merging can r
   assert.equal(access.visible(f.app, [f.row, child], f.a).length, 2);
 });
 
-test('ordinary Runner and automation drafts remain private alongside protected requirement cards', t => {
+test('an ordinary Runner chat becomes private when an automation or requirement card is saved', t => {
   const f = fixture(t), row = { ...f.row, adapterId: 'harness2', path: undefined };
+  assert.equal(access.classifyLocal(f.app, row.id, row).kind, 'ordinary');
+  assert.equal(access.assertDeviceReadable(f.app, row.id, f.actor(f.b), row).sharedOnDevice, true);
   f.save('conversation-work-cards', row.id, { version: 1, sessionId: row.id, owner: runtime.scope(f.a),
     cards: [{ actionId: 'work.automation.create' }] });
-  assert.equal(access.classifyLocal(f.app, row.id, row).kind, 'ordinary');
+  assert.equal(access.classifyLocal(f.app, row.id, row).kind, 'protected');
+  assert.throws(() => access.assertDeviceReadable(f.app, row.id, f.actor(f.b), row));
   assert.doesNotThrow(() => access.assertLocalMutation(f.app, row.id, f.actor(f.a), row));
   assert.throws(() => access.assertLocalMutation(f.app, row.id, f.actor(f.b), row));
   f.save('conversation-work-cards', row.id, { version: 1, sessionId: row.id, owner: runtime.scope(f.a),

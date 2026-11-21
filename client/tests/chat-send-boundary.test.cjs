@@ -92,6 +92,31 @@ test('automation timing uses the send click before asynchronous access checks', 
   assert.equal(f.requests.length, 0);
 });
 
+test('activating a desktop preview keeps the draft until a writable handle exists and sends the new turn once', async () => {
+  const f = fixture(), activating = deferred(), attempts = [];
+  f.input.value = 'Only this new message';
+  f.ctx._snap = { ...f.ctx._snap, localReplica: true, messages: [{ role: 'user', text: 'Historical tool request' }],
+    execution: { readOnly: true, canContinueOnDevice: true } };
+  f.ctx._ensure = async (id, previewRef) => {
+    attempts.push([id, previewRef]);
+    await activating.promise;
+    f.ctx._ref = 'new-runtime';
+    f.ctx._snap = { status: 'idle', messages: f.ctx._snap.messages };
+    return true;
+  };
+  const sending = f.ctx._sendCore();
+  await flush();
+  assert.equal(await f.ctx._sendCore(), false);
+  assert.equal(f.input.value, 'Only this new message');
+  assert.equal(f.requests.length, 0);
+  activating.resolve();
+  assert.equal(await sending, true);
+  assert.deepEqual(attempts, [['archive-a', 'ref-a']]);
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.requests[0][0], 'new-runtime');
+  assert.equal(f.requests[0][1], 'Only this new message');
+});
+
 test('model preflight shows pending state, preserves an acceptance draft on failure, and allows retry', async () => {
   const f = fixture(), check = deferred(), states = [];
   let token = 0, cleared = 0;

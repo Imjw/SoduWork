@@ -164,7 +164,7 @@ function install({ app, ipcMain, session, BrowserWindow, dialog, shell, cloudHis
       const piEntry = found && found.ok && found.entry && found.entry.path ? found.entry : null;
       /* Search runtime records when the conversation is absent from Pi archives. */
       let runnerRow = missingOnly ? guard.row || { title: '这条会话' } : guard.accountOnly ? guard.row
-        : switched || piEntry ? null : await session.findRunnerRow(id, { strict: true });
+        : switched || piEntry ? null : await session.findRunnerRow(id, { strict: true, metadataOnly: true });
       const accountOnly = guard.accountOnly || (!switched && !piEntry &&
         (!runnerRow || runnerRow.accountConversation) && guard.account?.found === true);
       if (accountOnly) runnerRow = guard.account?.projection || guard.row || { title: '这条会话' };
@@ -312,13 +312,15 @@ function install({ app, ipcMain, session, BrowserWindow, dialog, shell, cloudHis
     }
     catch (error) { return { ok: false, reason: '恢复没有完成：' + String(error && error.message || error) }; }
   });
-  ipcMain.handle('pi-session-history-archived', async () => {
+  ipcMain.handle('pi-session-history-archived', async event => {
     try {
+      const { isTrusted } = require('../access-control/preferences'), desktop = isTrusted(event);
       const captured = historyAccess.actor(app);
       const result = await session.archivedHistory(app);
       historyAccess.assertCurrent(app, captured);
       const identity = require('../conversation/requirement-context').cachedIdentity(app);
-      const rows = require('../conversation/work-conversation-cards').visibleHistory(app, result.chats || [], identity);
+      if (desktop && !isTrusted(event)) throw Error('页面已变化，请重新读取会话');
+      const rows = require('../conversation/work-conversation-cards').visibleHistory(app, result.chats || [], identity, desktop);
       return { ...result, chats: rows.map(row => conversationTitles.decorate(app,
         require('../conversation/requirement-context').decorate(app, row, identity))) };
     } catch (error) {

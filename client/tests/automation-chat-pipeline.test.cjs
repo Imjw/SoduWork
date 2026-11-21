@@ -10,8 +10,21 @@ test('automation and UI really call the same chat open/send pipeline; internal c
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'soduwork-chat-pipeline-test-'));
   const archivePath = path.join(directory, 'pi-agent', 'sessions', 'archived-chat.jsonl');
   fs.mkdirSync(path.dirname(archivePath), { recursive: true });
-  fs.writeFileSync(archivePath, JSON.stringify({ type: 'message', message: {
+  fs.writeFileSync(archivePath, JSON.stringify({ type: 'session', id: 'archived-chat' }) + '\n' + JSON.stringify({ type: 'message', message: {
     role: 'assistant', content: [{ type: 'text', text: 'Shared local history' }] } }) + '\n');
+  const piAgentArchive = path.join(path.dirname(archivePath), 'pipeline-pi.jsonl');
+  fs.writeFileSync(piAgentArchive, [
+    { type: 'session', id: 'archived-agent:pi' },
+    { type: 'message', message: { role: 'user', content: 'Saved Pi request' } },
+  ].map(entry => JSON.stringify(entry)).join('\n'));
+  const runnerReads = new Set();
+  t.mock.method(require('../main/runner-runtime'), 'rpc', async (op, { ref, since }) => {
+    assert.equal(op, 'job.session');
+    assert.match(ref, /^archived-agent:/);
+    runnerReads.add(ref);
+    return { ok: true, data: { ok: true, seq: 1, items: since ? [] : [
+      { seq: 1, kind: 'user', text: 'Saved Runner request' }] } };
+  });
   const file = path.resolve(__dirname, '../main/pi-session/ipc.js'), realRequire = createRequire(file);
   const handlers = new Map(), handles = [], opens = [], submits = [], quit = [], warms = [];
   let identity = { ...require('./helpers/platform-session-fixture.cjs').identity(), hub: 'http://isolated.invalid' };
@@ -32,14 +45,22 @@ test('automation and UI really call the same chat open/send pipeline; internal c
   }, list: () => handles, closeAll() {}, get: ref => handles.find(x => x.ref === ref),
   findBySessionId: id => handles.find(x => x.sessionId === id),
   attachView(view) { handles.push(view); return view; },
-  historyEntry: async (_app, id) => ({ ok: true, entry: id === 'archived-chat'
-    ? { id, path: archivePath, cwd: directory, at: 42 } : null }),
+  historyEntry: async (_app, id) => ['archived-chat', 'archived-agent:pi'].includes(id)
+    ? { ok: true, entry: { id, path: id === 'archived-chat' ? archivePath : piAgentArchive, cwd: directory, at: 42 } }
+    : { ok: false, notFound: true },
   history: async () => { throw Error('Opening an identity must not scan the sidebar'); },
   archivedConversation: async (_app, id) => id === 'archived-chat'
     ? { id, path: archivePath, cwd: directory, adapterId: 'pi', at: 42 }
     : id.startsWith('archived-agent:')
       ? { id, path: 'verified.jsonl', cwd: directory, adapterId: id.slice('archived-agent:'.length), at: 42 } : null };
   const mocks = {
+    '../conversation/account-sync-store': { createWorker() {
+      assert.fail('Opening local chats must not open or replay the legacy account outbox');
+    } },
+    '../conversation/account-sync': { create(options) {
+      assert.equal(options.enabled, false, 'production native chats must not publish even directory metadata');
+      return realRequire('../conversation/account-sync').create(options);
+    } },
     electron: { shell: {}, clipboard: {}, nativeImage: {}, dialog: {} },
     '../agent-runtime/pi-session-bridge': sessions,
     '../conversation/capabilities': { inspect: async () => ({ policyOk: true, items: [], businessSkills: [] }),
@@ -68,6 +89,8 @@ test('automation and UI really call the same chat open/send pipeline; internal c
       ipcMain: { handle: (name, listener) => handlers.set(name, listener), on() {} },
       BrowserWindow: { fromWebContents: () => owner, getAllWindows: () => [] }, identityOf: async () => identity,
     });
+    const syncResult = await service.sync();
+    assert.equal(syncResult.disabled, true);
     assert.equal(typeof service.captureAutomationAccess, 'function', 'manual runs must use a main-process preference source');
     assert.equal(typeof service.openAutomation, 'function', 'worker access context needs a dedicated non-IPC entry');
     assert.equal(typeof handlers.get('pi-session-automation-open'), 'function',
@@ -95,8 +118,8 @@ test('automation and UI really call the same chat open/send pipeline; internal c
     assert.ok(opens.every(x => !x.taskRef && !x.intent));
     assert.ok(submits.every(x => !x.opts.taskId && !x.opts.controlled));
     assert.equal((await service.open({}, { ...identity, clientId: 'wrong' })).ok, false);
-    // An archive can carry an imported-memory binding while the device session
-    // is expired. The transcript must still reopen; memory is optional.
+    // Private memory bindings retain authenticated access. Ordinary native
+    // history can still reopen using the trusted offline account provenance.
     const now = Math.floor(Date.now() / 1000);
     const claims = Buffer.from(JSON.stringify({ typ: 'device', uid: 'user-1', cid: 'device', iat: now - 3600, exp: now + 3600 })).toString('base64url');
     const ownerSession = claims + '.' + 'a'.repeat(64);
@@ -107,6 +130,9 @@ test('automation and UI really call the same chat open/send pipeline; internal c
     fs.writeFileSync(bindingFile, JSON.stringify({ owner: bindingOwner, hub: new URL(identity.hub).origin, ids: ['memory-id'] }));
     trustedOwner = bindingOwner;
     identity = { ...identity, session: expiredClaims + '.' + 'b'.repeat(64) };
+    const protectedArchive = await handlers.get('pi-session-open')(event, { chatId: 'archived-chat' });
+    assert.equal(protectedArchive.ok, false, 'Expired credentials cannot authorize account-private memories');
+    fs.writeFileSync(bindingFile, JSON.stringify({ owner: bindingOwner, hub: new URL(identity.hub).origin, ids: [] }));
     const archived = await handlers.get('pi-session-open')(event, { chatId: 'archived-chat' });
     assert.equal(archived.ok, true, archived.reason);
     assert.equal(archived.resumed, true);
@@ -117,6 +143,7 @@ test('automation and UI really call the same chat open/send pipeline; internal c
     assert.equal(missing.ok, false);
     assert.equal(missing.notFound, true, 'only a verified missing archive permits empty task draft recovery');
     assert.equal(opens.length, count, 'missing history must never create a replacement conversation');
+    fs.writeFileSync(bindingFile, JSON.stringify({ owner: bindingOwner, hub: new URL(identity.hub).origin, ids: ['memory-id'] }));
     identity = { ...identity, session: require('./helpers/platform-session-fixture.cjs').sessions().two };
     trustedOwner = require('../main/platform-connections/runtime.cjs').scope(identity);
     const foreign = await handlers.get('pi-session-open')(event, { chatId: 'archived-chat' });
@@ -149,6 +176,8 @@ test('automation and UI really call the same chat open/send pipeline; internal c
         { chatId: 'archived-agent:' + adapterId, adapterId: adapterId === 'pi' ? 'opencode' : 'pi' });
       assert.equal(history.ok, true, history.reason);
       assert.equal(opens.at(-1).adapterId, adapterId, 'archived runtime must override stale composer choice');
+      if (adapterId !== 'pi') assert.ok(runnerReads.has('archived-agent:' + adapterId),
+        'A legacy native resume must verify the archived execution evidence');
       assert.equal(warms.length - before, adapterId === 'pi' ? 1 : 0, adapterId + ' archived chat');
     }
     const beforeCatalog = warms.length;

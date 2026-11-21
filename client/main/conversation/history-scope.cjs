@@ -5,6 +5,7 @@
 const access = require('./history-access');
 const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
 const snapshots = require('./metadata-snapshot.cjs');
+const { automaticAccountCache } = require('./history-cache-policy.cjs');
 const OWNER_DIRECTORIES = new Set(['session-memory-bindings', 'requirement-session-context',
   'conversation-runtime-segments', 'conversation-history-owners']);
 async function ownerStamp(app) {
@@ -69,7 +70,8 @@ function create({ app, store, identityOf }) {
         current.epoch !== captured.epoch) throw Error('账号或服务已切换，请重新读取会话');
   }
   function readable(row, captured) {
-    try { access.assertReadable(app, row.id, captured, row); return true; }
+    if (automaticAccountCache(row)) return false;
+    try { access.assertDeviceReadable(app, row.id, captured, row); return true; }
     catch (_) { return false; }
   }
   async function catalog(captured, refresh = false, retry = false) {
@@ -90,7 +92,7 @@ function create({ app, store, identityOf }) {
       const items = [], allowed = new Set(), origins = [];
       for (let index = 0; index < source.items.length; index++) {
         const item = source.items[index];
-        if (canRead({ ...item.ownership, historyAliasIds: item.historyAliasIds })) {
+        if (!item.ownership?.automaticAccountCache && canRead({ ...item.ownership, historyAliasIds: item.historyAliasIds })) {
           const { ownership, ...publicItem } = item;
           publicItem.originIds = [];
           items.push(publicItem); allowed.add(item.id);
@@ -155,7 +157,11 @@ function create({ app, store, identityOf }) {
       const batch = await store.directory(cursor, Math.min(200, limit - items.length));
       guard(captured);
       if (batch.hasMore && batch.cursor <= cursor) throw Error('Local history cursor did not advance');
-      items.push(...batch.items.filter(row => view.allowed.has(row.id) && readable(row, captured)));
+      items.push(...batch.items.filter(row => {
+        if (!view.allowed.has(row.id)) return false;
+        try { access.assertReadable(app, row.id, captured, row); return true; }
+        catch (_) { return false; }
+      }));
       cursor = batch.cursor; hasMore = batch.hasMore;
     } while (hasMore && items.length < limit);
     await assertCatalogCurrent(captured, view);

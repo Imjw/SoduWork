@@ -70,6 +70,9 @@ function create({ app, session, history, BrowserWindow, shell, trash, resolveAli
           session.setArchived?.(app, row.id, true);
           const result = await session.permanentlyDeleteHistory(app, row.id, { localOnly: true });
           if (!result?.ok && !result?.notFound) throw Error(result?.reason || '清理会话记录失败，请重试');
+        } else if (row.adapterId && row.adapterId !== 'pi') {
+          const result = await session.forgetRunner(app, row.id, { localOnly: true, adapterId: row.adapterId });
+          if (!result?.ok && !result?.notFound) throw Error(result?.reason || '清理会话记录失败，请重试');
         } else {
           const found = await session.historyEntry?.(app, row.id, { strict: true });
           await options.assertCurrent?.(true);
@@ -77,7 +80,11 @@ function create({ app, session, history, BrowserWindow, shell, trash, resolveAli
             require('../conversation/history-access').actor(app), { ...row, workOwner: found.entry.workOwner });
           if (found?.ok && found.entry?.path) await trash(shell, found.entry.path);
           else if (found?.ok === false && !found.notFound) throw Error(found.reason);
-          else {
+          else if (row.adapterId !== 'pi' || typeof row.path !== 'string' || !require('node:path').isAbsolute(row.path) ||
+              row.historyAliasIds?.length || row.runtimeConversationId || row.deviceTransferId ||
+              row.usedHarnesses && (!Array.isArray(row.usedHarnesses) || row.usedHarnesses.some(adapter => adapter !== 'pi'))) {
+            // Only an indexed plain Pi source with no cross-runtime identity
+            // can be classified without consulting other native providers.
             const result = await session.forgetRunner(app, row.id, { localOnly: true });
             if (!result?.ok && !result?.notFound) throw Error(result?.reason || '清理会话记录失败，请重试');
           }

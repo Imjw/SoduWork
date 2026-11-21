@@ -92,6 +92,23 @@ test('cold identity lookup reads only the requested archive before the sidebar i
   assert.equal(reads(), 1);
 });
 
+test('cold absence and legacy filename lookups skip unrelated transcript bodies without losing list entries', async t => {
+  const f = await fixture(t);
+  await Promise.all(Array.from({ length: 24 }, (_, i) => f.write('unrelated-' + i)));
+  await f.write('old-filename', [header('legacy-id'), message('Original question'), message('Follow-up')]);
+  const projected = [];
+  const index = createArchiveHistory({ root: f.root, project: summary => {
+    projected.push(summary.id);
+    return { id: summary.id, at: summary.modified, count: summary.messageCount };
+  } });
+  assert.equal(await index.find('missing', { strict: true }), null);
+  assert.deepEqual(projected, []);
+  assert.equal((await index.find('legacy-id', { strict: true })).count, 2);
+  assert.deepEqual(projected, ['legacy-id']);
+  assert.equal((await index.list()).length, 25);
+  assert.equal(projected.length, 25);
+});
+
 test('internal context never enters cold, cached, direct or archived conversation titles', async t => {
   const connector = require('../main/pi-session/connector-context.cjs');
   const plugins = require('../main/pi-session/plugin-context');

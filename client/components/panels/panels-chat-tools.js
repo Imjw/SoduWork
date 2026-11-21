@@ -515,7 +515,7 @@
       showStop ? '\u505c\u6b62\u751f\u6210' : '\u53d1\u9001';
     send.classList.toggle('stop', showStop && !transient);
     send.classList.toggle('stop-pending', transient);
-    send.disabled = transient;
+    send.disabled = transient || root.querySelector('#nchatInput')?.disabled === true;
     send.setAttribute('aria-busy', String(transient));
     send.title = title;
     send.setAttribute('aria-label', title);

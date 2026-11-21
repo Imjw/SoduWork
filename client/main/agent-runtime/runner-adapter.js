@@ -499,25 +499,30 @@ async function createRunnerHandle(request, defaults, initialSession) {
     }
     accessControl = capability;
   }
+  const allowHistoricalModel = !opts.startDeviceSegment && Boolean(resumedRef || opts.resumedConversation);
   let prepared = accountModel
     ? { ok: true, model: { id: modelName, name: modelName || displayName, baseUrl: '', key: '' } }
     : await models.fetchModel(identity, modelName, undefined, undefined, false, adapterId,
-      { app, allowLocal: true, allowHistorical: Boolean(resumedRef || opts.resumedConversation) });
+      { app, allowLocal: true, allowHistorical: allowHistoricalModel });
   // A Runner archive can outlive the model catalog just like a native Pi archive.
   // Historical model names are hints, not a reason to make the whole conversation
   // unreadable. Retry only resumed conversations with the current default; new
   // chats keep an explicit model failure visible so a typo is not silently changed.
-  const canRecoverStaleModel = Boolean(resumedRef || opts.resumedConversation) && !modelName.startsWith('local:') &&
+  const canRecoverStaleModel = allowHistoricalModel && !modelName.startsWith('local:') &&
     prepared?.code !== 'LOCAL_AGENT_DEFAULT_UNAVAILABLE';
   const returnedModel = String(prepared?.model?.id || '').trim();
   const returnedDifferentModel = Boolean(prepared?.ok && modelName && returnedModel && returnedModel !== modelName);
+  if (opts.startDeviceSegment && returnedDifferentModel && !prepared.model.localOnly &&
+      !require('../../core/model-choice').imageChoice(modelName)) {
+    throw new RuntimeContractError('RUNNER_MODEL_UNAVAILABLE', '当前账号无法使用所选模型，请重新选择模型后发送');
+  }
   let resetSavedModel = false;
   if (canRecoverStaleModel && (!prepared?.ok || returnedDifferentModel)) {
     const fallback = accountModel
       ? { ok: true, model: { id: '', name: displayName, baseUrl: '', key: '' } }
       : await models.fetchModel(identity, '', undefined, undefined, false, adapterId,
         { app, allowLocal: true, ignoreAgentPreference: true,
-          allowHistorical: Boolean(resumedRef || opts.resumedConversation) });
+          allowHistorical: allowHistoricalModel });
     if (fallback?.ok && fallback.model) {
       modelName = '';
       prepared = fallback;
@@ -590,6 +595,8 @@ async function createRunnerHandle(request, defaults, initialSession) {
     recoveryRequired: false, terminalConfirmed: false, recoveryAttempts: 0,
     initialSession: initialSession || null,
   };
+  const transferCloseToken = {};
+  let transferClosePending = false;
 
   state.modelSelection = selectionModule.create({
     name: modelName, model: prepared.model,
@@ -2124,7 +2131,42 @@ async function createRunnerHandle(request, defaults, initialSession) {
         throw Error('当前轮次的成果已变化，请刷新后重试');
       return { ...scanned, fileChanges, pluginValidation: pluginGeneration.records(handle) };
     },
-    close() {
+    async closeForDeviceTransfer() {
+      const refusal = () => Object.assign(Error('原执行尚未确认结束，迁移保持冻结；请核对本机执行状态后重试'),
+        { code: 'DEVICE_TRANSFER_EXECUTION_UNCONFIRMED' });
+      const idle = () => !state.disposed && !handle.inFlight() && !state.preparingPlugins &&
+        !state.pluginGenerationActive && !state.pluginGenerationPreparing && !state.turnSubmissionPending &&
+        !state.accessChangePending && !state.accessRestorePending && !state.modelChoicePending &&
+        !state.pendingTaskGoalControl && !state.stopAwaitingTerminal && !state.goalStopAwaitingTerminal &&
+        !state.goalPaused && !state.queueImmediate.blocked() && !pausedPreparation &&
+        (!state.taskGoal || ['completed','disabled'].includes(state.taskGoal.status)) &&
+        !(state.taskExecutions || []).some(row => !TERMINAL_STATES.has(row.status) || row.running || row.active) &&
+        !state.tools.some(tool => !['done','completed','failed','error','cancelled','canceled'].includes(tool.state));
+      if (transferClosePending || !idle()) throw refusal();
+      transferClosePending = true;
+      const serial = state.turnSerial, generation = submissionGeneration;
+      const external = JSON.stringify(state.taskExecutions || []);
+      try {
+        // A never-dispatched segment has no native job. Every existing segment
+        // needs fresh local Runner proof; a cached UI terminal cannot authorize handoff.
+        if (state.started || resumedRef || taskJournal.nativeHistoryObserved) {
+          const reply = await runtime.rpc('job.session',{ref:state.runnerRef,since:state.seq,limit:1},15000);
+          const data = reply?.data;
+          if (reply?.ok !== true || data?.ok !== true || data.ref !== state.runnerRef ||
+              !TERMINAL_STATES.has(data.status) || data.deviceTransfer?.schemaVersion !== 1 ||
+              data.deviceTransfer.quiescent !== true || data.pendingPermissions?.length || data.stopPending ||
+              data.detached || data.canStop || data.taskGoal && !['completed','disabled'].includes(data.taskGoal.status)) throw refusal();
+        }
+        if (!idle() || state.turnSerial !== serial || submissionGeneration !== generation ||
+            JSON.stringify(state.taskExecutions || []) !== external) throw refusal();
+        // No await separates this final check and passive disposal. Ordinary
+        // close retains its stop behavior; migration must never stop active work.
+        handle.close(transferCloseToken);
+        return true;
+      } catch (_) { throw refusal(); }
+      finally { transferClosePending = false; }
+    },
+    close(transferProof) {
       pausedPreparation = null;
       if (state.disposed) return;
       state.disposed = true;
@@ -2141,7 +2183,7 @@ async function createRunnerHandle(request, defaults, initialSession) {
       state.cancelRequested = true;
       state.timer = null;
       turnQueue.clear({ ok: false, reason: '会话已关闭' });
-      requestStop();
+      if (transferProof !== transferCloseToken) requestStop();
       listeners.clear();
       redactors.clear();
       settle({ ok: false, reason: '会话已关闭' });
@@ -2364,10 +2406,10 @@ function createRunnerRuntimeAdapter(options) {
       const handle = await createRunnerHandle(request, defaults, initialSession);
       return wrapRunnerSession(handle, request, { ok: true, resumed: true }, runtimeSpec);
     },
-    async historyEntry(id, { strict = false } = {}) {
+    async historyEntry(id, { strict = false, metadataOnly = false } = {}) {
       try {
         const row = (await _runnerInventory(runtime, { force: strict })).find(row => row.ref === id && isChat(row));
-        return { ok: true, chats: row ? [await historyRow(row)] : [] };
+        return { ok: true, chats: row ? [await historyRow(row, metadataOnly)] : [] };
       } catch (error) {
         return { ok: false, reason: String(error && error.message || error), chats: [] };
       }

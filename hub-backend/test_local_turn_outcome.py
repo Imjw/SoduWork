@@ -96,6 +96,96 @@ class TurnOutcomeTests(unittest.TestCase):
         self.assertIn("HTTP 404", page["error"])
         self.assertIn("切换可用模型", page["error"])
 
+    def test_device_transfer_receipt_requires_a_settled_terminal_run(self):
+        self.run["eventDestination"] = "local"
+        for state in ("done", "failed", "stopped", "interrupted"):
+            with self.subTest(state=state):
+                self.run.update(state=state, proc=None, stopping=False)
+                self.assertEqual(ai_local.session_sync({}, self.ref)["deviceTransfer"],
+                                 {"schemaVersion": 1, "quiescent": True})
+        for state in ("running", "queued", "dispatching", "recovering", "unknown", None):
+            with self.subTest(state=state):
+                self.run["state"] = state
+                self.assertFalse(ai_local.session_sync({}, self.ref)["deviceTransfer"]["quiescent"])
+
+    def test_device_transfer_stopped_does_not_bypass_cleanup_queue_or_approval(self):
+        self.run.update(state="stopped", eventDestination="local")
+        for field, value in (("stopping", True), ("detached", True), ("proc", object()),
+                             ("_launchPending", {"cancelled": True}), ("_hostCleanup", object()),
+                             ("queue", ["retained follow-up"]), ("goalUserPending", "retained goal input"),
+                             ("contextCompacting", True), ("_accessTransition", {"phase": "preparing"}),
+                             ("pendingPermissions", [{"id": "approval"}]), ("permissionWaiting", True)):
+            with self.subTest(field=field):
+                self.run[field] = value
+                receipt = ai_local.session_sync({}, self.ref)["deviceTransfer"]
+                self.assertEqual(receipt, {"schemaVersion": 1, "quiescent": False})
+                self.run.pop(field)
+                self.assertTrue(ai_local.session_sync({}, self.ref)["deviceTransfer"]["quiescent"])
+
+    def test_device_transfer_goal_must_be_complete_without_unsettled_tools(self):
+        self.run.update(state="done", eventDestination="local", goalContract={"objective": "Retain this goal"})
+        for state in (None, "active", "reviewing", "paused", "blocked", "failed", "unknown"):
+            with self.subTest(state=state):
+                self.run["goalState"] = {"status": state}
+                self.assertFalse(ai_local.session_sync({}, self.ref)["deviceTransfer"]["quiescent"])
+        for state in ("completed", "disabled"):
+            with self.subTest(state=state):
+                self.run["goalState"] = {"status": state, "pending": {}}
+                self.assertTrue(ai_local.session_sync({}, self.ref)["deviceTransfer"]["quiescent"])
+                self.run["goalState"]["pending"] = {"tool-call": {"tool": "write"}}
+                self.assertFalse(ai_local.session_sync({}, self.ref)["deviceTransfer"]["quiescent"])
+        self.run.pop("goalState")
+        self.assertFalse(ai_local.session_sync({}, self.ref)["deviceTransfer"]["quiescent"])
+
+    def test_device_transfer_archive_only_or_missing_run_never_claims_quiescence(self):
+        _RUNS.pop(self.ref)
+        with patch.object(ai_local, "_read_events", return_value=[{"seq": 1, "text": "retained"}]):
+            receipt = ai_local.session_sync({}, self.ref)
+            self.assertEqual(receipt["status"], "unknown")
+            self.assertEqual(receipt["deviceTransfer"], {"schemaVersion": 1, "quiescent": False})
+        with patch.object(ai_local, "_read_events", return_value=[]):
+            receipt = ai_local.session_sync({}, self.ref)
+            self.assertFalse(receipt["ok"])
+            self.assertFalse(receipt["deviceTransfer"]["quiescent"])
+
+    def test_strict_history_distinguishes_absent_archive_from_unreadable_partial_and_empty(self):
+        _RUNS.pop(self.ref)
+        cfg = {"historyRead": True}
+        folder = os.path.join(ai_local._STORE, self.ref)
+        os.makedirs(ai_local._STORE, exist_ok=True)
+        missing = ai_local.session_sync(cfg, self.ref)
+        self.assertEqual((missing.get("code"), missing.get("ref")), ("NATIVE_HISTORY_MISSING", self.ref))
+        self.assertFalse(os.path.exists(folder))
+        self.assertNotEqual(ai_local.session_sync(cfg, self.ref, since=1).get("code"), "NATIVE_HISTORY_MISSING")
+        os.mkdir(folder)
+        journal = os.path.join(folder, "events.jsonl")
+        for contents in ["", "invalid JSON\n", '{"seq":1,"kind":"user","text":"keep"}\ninvalid\n']:
+            with self.subTest(contents=contents):
+                with open(journal, "w", encoding="utf-8") as out:
+                    out.write(contents)
+                self.assertEqual(ai_local.session_sync(cfg, self.ref).get("code"), "NATIVE_HISTORY_UNAVAILABLE")
+        with patch.object(ai_local, "_read_events", side_effect=PermissionError):
+            self.assertEqual(ai_local.session_sync(cfg, self.ref).get("code"), "NATIVE_HISTORY_UNAVAILABLE")
+
+    def test_device_transfer_requires_trusted_local_or_proven_legacy_event_ownership(self):
+        from app.services.dispatch_identity import execution_ref
+        self.run.update(state="done", eventDestination="local")
+        self.assertTrue(ai_local.session_sync({}, self.ref)["deviceTransfer"]["quiescent"])
+        for destination in ("hub", "unknown", "", None, False):
+            with self.subTest(destination=destination):
+                self.run["eventDestination"] = destination
+                self.assertFalse(ai_local.session_sync({}, self.ref)["deviceTransfer"]["quiescent"])
+        self.run.pop("eventDestination")
+        self.assertFalse(ai_local.session_sync({}, self.ref)["deviceTransfer"]["quiescent"])
+        self.run["taskId"] = "chat-transfer-legacy"
+        legacy_ref = execution_ref("chat:" + self.run["taskId"] + ":" + self.run["cli"])
+        _RUNS[legacy_ref] = self.run
+        self.addCleanup(lambda: _RUNS.pop(legacy_ref, None))
+        self.assertTrue(ai_local.session_sync({}, legacy_ref)["deviceTransfer"]["quiescent"])
+        self.assertFalse(ai_local.session_sync({}, self.ref)["deviceTransfer"]["quiescent"])
+        self.run["eventDestination"] = "hub"
+        self.assertFalse(ai_local.session_sync({}, legacy_ref)["deviceTransfer"]["quiescent"])
+
     def test_model_diagnostics_classify_without_publishing_provider_body(self):
         for value, expected in (
             ('401 {"secret":"private-key"}', "请检查模型授权"),

@@ -16,6 +16,7 @@ from .api import admin, agents, ai_proxy, aidesk, approvals, attachments, capabi
 from .api import admin_cloud_runners, client_auth, cloud_environments, cloud_conversations, conversation_handoffs, deliveries, memory_records, session_memory
 from .api import account_profile, admin_mail, client_email_auth, quotas, legal_documents
 from .api import remote_screen
+from .api import device_peer_identity
 from .api import conversation_projects
 from .api import account_conversations
 from .api import conversation_content_migrations
@@ -378,6 +379,7 @@ for _r in (cloud_execution_sync.router, legal_documents.router, legal_documents.
            capabilities.router, capabilities.admin_router, jiyong_data.router):
     app.include_router(_r)
 app.include_router(personal_conversation_relay.router)
+app.include_router(device_peer_identity.router)
 app.include_router(conversation_content_migrations.router)
 from .api import desktop_capabilities
 app.include_router(desktop_capabilities.router)

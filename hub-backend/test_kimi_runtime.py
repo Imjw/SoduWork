@@ -83,7 +83,16 @@ class KimiOutcomeTests(unittest.TestCase):
         loader = Path(kimi_runtime.__file__).with_name("kimi_acp_outcome.mjs")
         script = """
 import assert from 'node:assert/strict';
-const {settleTurnOutcome, transformSource} = await import(process.argv[1]);
+const {settleTurnOutcome, stepUsage, transformSource} = await import(process.argv[1]);
+const driver = {};
+const receipt = {step: 1, usage: {inputOther: 120, inputCacheCreation: 0, output: 8}};
+assert.deepEqual(stepUsage(driver, receipt), {
+  inputTokens: 120, outputTokens: 8, totalTokens: 128, cachedWriteTokens: 0
+});
+assert.equal(stepUsage(driver, receipt), undefined);
+assert.equal(stepUsage(driver, {step: 2, usage: {...receipt.usage, inputCacheRead: -1}}), undefined);
+assert.equal(stepUsage(driver, {step: 2, usage: {...receipt.usage, inputOther: 100, inputCacheRead: 20}}).totalTokens, 128);
+assert.equal(stepUsage(driver, {step: 3, usage: {inputOther: 0, inputCacheCreation: 0, output: 0}}), undefined);
 const RequestError = {
   authRequired: (_, message) => ({kind:'auth', message}),
   internalError: (_, message) => ({kind:'internal', message}),

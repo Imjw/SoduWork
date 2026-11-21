@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     soduwork_env: str = "development"
     # auto: upgrade/adopt at startup (single-instance/dev); check: release job migrates first.
     db_migration_mode: str = "auto"
+    proxy_usage_shadow_enabled: bool = False
     # Enable before transcript migration; old peers then cannot refill Hub bodies.
     # Rolling upgrades keep legacy reads until every endpoint has acknowledged.
     soduwork_conversation_metadata_only: bool = False

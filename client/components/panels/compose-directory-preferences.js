@@ -81,7 +81,12 @@
     if (blocked) announce();
     return active && !blocked;
   }
-  function selectionStarted() { explicitRevision++; if (active) { if (pending) blocked = true; generation++; pending = null; } }
+  function selectionStarted() {
+    explicitRevision++;
+    if (active) { if (pending) blocked = true; generation++; pending = null; }
+    const ticket = generation, revision = explicitRevision;
+    return () => ticket === generation && revision === explicitRevision;
+  }
   function selectionCommitted() {
     selectionStarted();
     if (!active) return;

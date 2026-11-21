@@ -72,6 +72,7 @@ function createPiSessionBridge(options) {
 
   const byRef = new Map();
   const bySessionId = new Map();
+  const openingHistoryIds = new Set();
   const pendingDisposals = new Set();
   const fileStores = new Map();
   const memoryStore = new MemoryGoalCheckpointStore();
@@ -168,6 +169,14 @@ function createPiSessionBridge(options) {
         // registry close facade. This symbol never crosses the preload bridge.
         if (property === Symbol.for('soduwork.agent-runtime.native-handle')) return entry.raw;
         if (property === 'close') return () => closeEntry(entry);
+        if (property === 'closeForDeviceTransfer') return async () => {
+          if (entry.closed) return false;
+          if ((entry.record?.adapterId || entry.raw.adapterId) !== 'pi') {
+            if (typeof entry.raw.closeForDeviceTransfer !== 'function' ||
+                await entry.raw.closeForDeviceTransfer() !== true) return false;
+          }
+          return closeEntry(entry);
+        };
         if (entry.supervisor && LEGACY_GOAL_CONTROLS[property]) {
           return () => entry.supervisor.control(LEGACY_GOAL_CONTROLS[property]);
         }
@@ -209,16 +218,41 @@ function createPiSessionBridge(options) {
 
   async function openNative(legacyOptions) {
     const adapterId = String(legacyOptions.adapterId || 'pi');
+    // Only the bounded handover belongs in the native process. The transcript
+    // and the desktop authorization grant stay with the logical conversation.
+    const { deviceHistoryRecovery, deviceContinuationGrant, ...nativeOptions } = legacyOptions;
+    if (deviceHistoryRecovery) nativeOptions.startDeviceSegment = true;
     const request = { adapterId, consumer: legacyOptions.intent === 'goal' ? 'goal' : 'chat',
       runtimeId: String(legacyOptions.runtimeId || 'desktop'), runtime: { app: legacyOptions.app || opts.app },
-      identity: legacyOptions.identity, native: { pi: { openOptions: legacyOptions }, runner: { openOptions: legacyOptions } } };
+      identity: legacyOptions.identity, native: { pi: { openOptions: nativeOptions }, runner: { openOptions: nativeOptions } } };
     const record = legacyOptions.resumePath ? await registry.resumeSession(request) : await registry.createSession(request);
     const details = record.adapterId === 'pi' ? getPiSessionDetails(record.session) : getRunnerSessionDetails(record.session);
     if (!details?.handle) { await registry.disposeSession(record.adapterId, record.session.id); throw Error('Agent Runtime did not expose its compatibility handle'); }
     return { record, raw: details.handle, details };
   }
 
+  let deviceTransfer = null;
   async function open(openOptions) {
+    const ids = new Set([openOptions?.retainedHistoryId, openOptions?.runtimeConversationId, openOptions?.workConversationId,
+      openOptions?.resumeSessionId, openOptions?.deviceHistoryRecovery?.row?.id].filter(Boolean));
+    // Work cards serialize their first execution and publish a dedicated receipt.
+    const historyIds = openOptions?.workConversation || openOptions?.workConversationId ? [] : ids;
+    for (const id of historyIds) {
+      if (openingHistoryIds.has(id)) return { ok: false, reason: '这条会话正在打开，请稍候' };
+    }
+    const releases = [];
+    try {
+      for (const id of historyIds) openingHistoryIds.add(id);
+      for (const id of ids) releases.push(deviceTransfer?.admit(id));
+      return await openRegisteredSession(openOptions);
+    } catch (error) {
+      return { ok: false, reason: _reason(error) };
+    } finally {
+      for (const id of historyIds) openingHistoryIds.delete(id);
+      for (const release of releases) release?.();
+    }
+  }
+  async function openRegisteredSession(openOptions) {
     let record = null, workId = '', workCommitted = false;
     let legacyOptions = { ...openOptions, app: openOptions?.app || opts.app }, restored;
     try {
@@ -227,7 +261,7 @@ function createPiSessionBridge(options) {
       // Explicit reopen disposes those registry entries before resuming the
       // same native archive; no command is replayed by the transport itself.
       for (const entry of new Set(byRef.values())) {
-        if (entry.raw.snapshot?.().runtimeUnavailable) await closeEntry(entry);
+        if (entry.record && entry.raw.snapshot?.().runtimeUnavailable) await closeEntry(entry);
       }
       if ((legacyOptions.adapterId || 'pi') === 'pi' && legacyOptions.retainedHistoryId && replicaHistory?.indexedRow) {
         // Disposal can flush a newer failed attempt after IPC read the initial row.
@@ -244,6 +278,18 @@ function createPiSessionBridge(options) {
       }
       await legacyOptions.validateWorkConversation?.();
       const adapterId = String(legacyOptions.adapterId || 'pi');
+      const historyRecovery = legacyOptions.deviceHistoryRecovery;
+      const deviceContinuation = legacyOptions.deviceContinuationGrant
+        ? require('../conversation/device-local-continuation.cjs').assert(legacyOptions.deviceContinuationGrant,
+          legacyOptions.app, legacyOptions.identity, historyRecovery?.row?.id || restored?.id) : null;
+      if (historyRecovery) {
+        if (legacyOptions.resumePath || restored || !historyRecovery.row?.id || !historyRecovery.prefix?.messages)
+          throw Error('本机历史恢复状态无效');
+        if (bySessionId.has(historyRecovery.row.id)) throw Error('会话已有执行进程，请重新打开会话');
+        legacyOptions = { ...legacyOptions, contextPrompts: [...(legacyOptions.contextPrompts || []),
+          require('../conversation/device-history-handover.cjs').brief(historyRecovery.prefix, {
+            row: historyRecovery.row, cwd: legacyOptions.cwd, attachments: historyRecovery.historyRecovery?.attachments || [] })] };
+      }
       if (!registry.get(adapterId)) {
         // Removed runtimes can expose their authenticated transcript, but never
         // acquire a replacement runtime, model credentials, or execution rights.
@@ -282,7 +328,10 @@ function createPiSessionBridge(options) {
               fromMessage: metric.fromMessage + offset, toMessage: metric.toMessage + offset }))] };
           legacyOptions = { ...legacyOptions, resumePath: '', resumeCwd: '', runtimeConversationId: '',
             nativeDispatchId: '', nativeSessionStarted: undefined, verifyLegacySegment: false,
-            contextPrompts: [...(openOptions.contextPrompts || []), runtimeSegments.brief(prefix)] };
+            contextPrompts: [...(openOptions.contextPrompts || []), restored.deviceHistoryComplete
+              ? require('../conversation/device-history-handover.cjs').brief(prefix, { row: restored.deviceHistoryContext || restored,
+                cwd: legacyOptions.cwd, attachments: restored.deviceHistoryContext?.attachments || restored.historyRecovery?.attachments || [] })
+              : runtimeSegments.brief(prefix)] };
           opened = await openNative(legacyOptions);
           record = opened.record;
           for (const binding of error.taskBindings || []) {
@@ -305,6 +354,36 @@ function createPiSessionBridge(options) {
       }
       record = opened.record; const details = opened.details;
       let raw = details.handle;
+      if (historyRecovery) {
+        const row = historyRecovery.row;
+        if (deviceContinuation) require('../conversation/device-local-continuation.cjs').assert(
+          legacyOptions.deviceContinuationGrant, legacyOptions.app, legacyOptions.identity, row.id);
+        const manifest = runtimeSegments.read(legacyOptions.app, row.id);
+        const previous = manifest && (manifest.deviceTransferId || '') === (row.deviceTransferId || '') ? manifest : null;
+        if (previous && !deviceContinuation) runtimeSegments.assertOwner(legacyOptions.app, previous, legacyOptions.identity);
+        for (const binding of row.taskBindings || (row.taskId ? [{ taskId: row.taskId, title: row.taskTitle }] : [])) {
+          const bound = await raw.bindTask?.(binding.taskId, binding.title || binding.taskTitle || '');
+          if (bound?.ok === false) throw Error(bound.reason || '无法恢复需求关联');
+        }
+        restored = { version: 1, id: row.id, owner: deviceContinuation?.original || runtimeSegments.scope(legacyOptions.identity),
+          ...(deviceContinuation ? { deviceShared: true, executionOwner: deviceContinuation.executionOwner } : {}),
+          title: row.title || '', cwd: legacyOptions.cwd, originAdapter: previous?.originAdapter || row.adapterId || adapterId,
+          at: Date.now(), prefix: historyRecovery.prefix,
+          artifactHistory: require('../conversation/runtime-artifacts.cjs').forContinuation(legacyOptions.cwd,
+            row.deviceTransferId ? undefined : historyRecovery.artifactHistory, previous?.artifactHistory),
+          segments: previous ? [...previous.segments, previous.active] : deviceContinuation ?
+            [{ sessionId: row.id, adapterId: row.adapterId || adapterId, path: row.path || row.id,
+              executionOwner: deviceContinuation.original }] : [], deviceHistoryComplete: true,
+          deviceTransferId: row.deviceTransferId || '',
+          deviceHistoryContext: require('../conversation/device-history-handover.cjs').context(row, historyRecovery.historyRecovery?.attachments || []),
+          historyRecovery: historyRecovery.historyRecovery, readOnly: legacyOptions.readOnly,
+          accessPolicy: legacyOptions.accessPolicy, activePluginIds: [],
+          active: { sessionId: raw.sessionId, adapterId, ref: raw.ref,
+            ...(deviceContinuation ? { executionOwner: deviceContinuation.executionOwner } : {}),
+            path: raw.resumeLocation?.() || raw.sessionId, modelName: raw.snapshot()?.modelSelection?.name || '',
+            nativeDispatchId: raw.historyRow?.()?.nativeDispatchId, started: false } };
+        await runtimeSegments.save(legacyOptions.app, restored);
+      }
       await legacyOptions.validateWorkConversation?.();
       if (legacyOptions.workConversation) {
         restored = require('../conversation/work-conversation-opening').bootstrapRecord(legacyOptions.workConversation, raw, legacyOptions);
@@ -339,6 +418,7 @@ function createPiSessionBridge(options) {
           entry.runtimeView = runtimeFacade(entry); byRef.set(next.raw.ref, entry);
         } });
       entry.view = facade(entry);
+      if (deviceContinuation) require('../conversation/device-local-continuation.cjs').bind(entry.view, legacyOptions.deviceContinuationGrant);
       entry.runtimeView = runtimeFacade(entry);
       byRef.set(ref, entry);
       bySessionId.set(sessionId, entry);
@@ -364,13 +444,16 @@ function createPiSessionBridge(options) {
 
   // Passive remote views share lookup, UI events and disposal with ordinary
   // sessions. They deliberately have no registered local execution runtime.
-  function attachView(raw) {
-    if (!raw?.ref || !raw.sessionId || byRef.has(raw.ref) || bySessionId.has(raw.sessionId)) {
+  function attachView(raw, { historyPreview = false } = {}) {
+    if (historyPreview && (!raw?.readOnly || !raw.localReplica)) throw Error('只有本机只读历史可作为独立视图打开');
+    if (!raw?.ref || !raw.sessionId || byRef.has(raw.ref) || (!historyPreview && bySessionId.has(raw.sessionId))) {
       throw new RuntimeContractError('SESSION_IDENTITY_CONFLICT', '会话已经打开，请接回原会话');
     }
     const entry = { ref: raw.ref, sessionId: raw.sessionId, raw, record: null,
       supervisor: null, closed: false, runtimeView: null };
-    entry.view = facade(entry); byRef.set(entry.ref, entry); bySessionId.set(entry.sessionId, entry);
+    entry.view = facade(entry); byRef.set(entry.ref, entry);
+    // A passive reader can coexist with the active account's native execution.
+    if (!historyPreview) bySessionId.set(entry.sessionId, entry);
     return entry.view;
   }
 
@@ -475,7 +558,7 @@ function createPiSessionBridge(options) {
     }
     return known || lifecycle.visible(row, archived);
   }
-  async function findRunnerRow(id, { nativeOnly = false, strict = false } = {}) {
+  async function findRunnerRow(id, { nativeOnly = false, strict = false, adapterId = '', metadataOnly = false } = {}) {
     const wanted = String(id || '').trim();
     if (!wanted) return null;
     if (!nativeOnly && typeof externalHistory?.historyEntry === 'function') {
@@ -491,17 +574,22 @@ function createPiSessionBridge(options) {
     // navigation is in flight. Resolve its authenticated alias by exact ID.
     const cloud = !nativeOnly && (await externalRows({ includeAliases: true })).chats.find(row => row.id === wanted);
     if (cloud) return cloud;
-    const results = await Promise.all(historyAdapters.map(async (adapter) => {
+    const adapters = adapterId ? historyAdapters.filter(adapter => adapter.id === adapterId) : historyAdapters;
+    if (adapterId && !adapters.length) throw new RuntimeContractError('RUNNER_HISTORY_UNAVAILABLE', '这条会话的历史底座不可用，请恢复后重试');
+    const lookup = { strict, ...(metadataOnly ? { metadataOnly: true } : {}) };
+    const results = await Promise.all(adapters.map(async (adapter) => {
       try {
         return typeof adapter.historyEntry === 'function'
-          ? await adapter.historyEntry(wanted, { strict }) : await adapter.history(Number.MAX_SAFE_INTEGER, { strict });
+          ? await adapter.historyEntry(wanted, lookup) : await adapter.history(Number.MAX_SAFE_INTEGER, lookup);
       }
       catch (error) { return { ok: false, reason: _reason(error), chats: [] }; }
     }));
     const row = results.flatMap(result => result.chats || [])
       .find(item => item && item.id === wanted);
+    if (row && adapterId && row.adapterId !== adapterId)
+      throw new RuntimeContractError('HISTORY_ID_MISMATCH', '会话底座归属已变化，请刷新后重试');
     if (row) return row;
-    if (historyAdapters.length && (strict ? results.some(result => !result?.ok || !Array.isArray(result.chats))
+    if (adapters.length && (strict ? results.some(result => !result?.ok || !Array.isArray(result.chats))
       : !results.some(result => result && result.ok))) {
       const failed = results.find(result => result && result.reason);
       throw new RuntimeContractError('RUNNER_HISTORY_UNAVAILABLE',
@@ -848,7 +936,7 @@ function createPiSessionBridge(options) {
       return sessionModule.archiveHistory(app || opts.app, wanted);
     }
     if (pi && pi.ok === false && !pi.notFound) return pi;
-    const runner = await findRunnerRow(wanted);
+    const runner = await findRunnerRow(wanted, { metadataOnly: true });
     if (!runner || typeof sessionModule.setArchived !== 'function') {
       return { ok: false, reason: '找不到这条会话' };
     }
@@ -868,7 +956,7 @@ function createPiSessionBridge(options) {
       return sessionModule.restoreHistory(app || opts.app, wanted);
     }
     if (piEntry && piEntry.ok === false && !piEntry.notFound) return piEntry;
-    const runner = await findRunnerRow(wanted);
+    const runner = await findRunnerRow(wanted, { metadataOnly: true });
     if (!runner) return { ok: false, notFound: true, reason: '找不到这条会话' };
     if (typeof sessionModule.setArchived === 'function') {
       if (!sessionModule.isArchived(app || opts.app, wanted)) {
@@ -880,11 +968,11 @@ function createPiSessionBridge(options) {
     return { ok: false, reason: '归档状态不可用' };
   }
 
-  async function permanentlyDeleteNativeHistory(app, id, { localOnly = false } = {}) {
+  async function permanentlyDeleteNativeHistory(app, id, { localOnly = false, adapterId = '' } = {}) {
     const wanted = String(id || '').trim();
     if (!wanted) return { ok: false, reason: '没有指定要删除的会话' };
-    const piEntry = typeof sessionModule.historyEntry === 'function'
-      ? await sessionModule.historyEntry(app || opts.app, wanted) : { ok: false, notFound: true };
+    const piEntry = (!adapterId || adapterId === 'pi') && typeof sessionModule.historyEntry === 'function'
+      ? await sessionModule.historyEntry(app || opts.app, wanted, { strict: true }) : { ok: false, notFound: true };
     if (piEntry && piEntry.ok && piEntry.entry && typeof sessionModule.permanentlyDeleteHistory === 'function') {
       return sessionModule.permanentlyDeleteHistory(app || opts.app, wanted);
     }
@@ -892,7 +980,10 @@ function createPiSessionBridge(options) {
     if (typeof sessionModule.isArchived !== 'function' || !sessionModule.isArchived(app || opts.app, wanted)) {
       return { ok: false, reason: '只能从归档历史彻底删除会话' };
     }
-    const runner = await findRunnerRow(wanted);
+    // A verified segment identifies its native provider. Local cleanup must
+    // never wait for account-wide discovery or an unrelated provider's log.
+    const runner = adapterId === 'pi' ? null : await findRunnerRow(wanted, {
+      nativeOnly: localOnly || !!adapterId, strict: localOnly || !!adapterId, adapterId, metadataOnly: true });
     if (!runner) {
       sessionModule.setArchived(app || opts.app, wanted, false);
       return { ok: true, id: wanted, alreadyDeleted: true };
@@ -926,10 +1017,11 @@ function createPiSessionBridge(options) {
     // Keep the public archive and manifest until all native archives are gone.
     for (const part of [...record.segments, record.active].filter(p => p.sessionId !== id)) {
       sessionModule.setArchived?.(app || opts.app, part.sessionId, true);
-      const result = await permanentlyDeleteNativeHistory(app, part.sessionId, { localOnly });
+      const result = await permanentlyDeleteNativeHistory(app, part.sessionId, { localOnly, adapterId: part.adapterId });
       if (!result?.ok && !result?.notFound) return result;
     }
-    const result = await permanentlyDeleteNativeHistory(app, id, { localOnly });
+    const original = [...record.segments, record.active].find(part => part.sessionId === id);
+    const result = await permanentlyDeleteNativeHistory(app, id, { localOnly, adapterId: original?.adapterId || '' });
     if (result?.ok || result?.notFound) {
       // Account lifecycle commits still need every source alias after the
       // transcripts are gone. The IPC transaction cleans this up after ACK.
@@ -1058,6 +1150,8 @@ function createPiSessionBridge(options) {
   }
 
   const api = {
+    deviceTransfer() { return deviceTransfer; },
+    setDeviceTransfer(controller) { deviceTransfer = controller; },
     setReplicaHistory(source) { replicaHistory = source; },
     indexedHistoryRow(id) { return replicaHistory?.indexedRow(id) || null; },
     setExternalHistory(source) { externalHistory = source; },
@@ -1088,9 +1182,12 @@ function createPiSessionBridge(options) {
     findRunnerRow,
     probeMissingHistory,
     removeMissingHistory,
-    async forgetRunner(app, id, { localOnly = false } = {}) {
-      const row = await findRunnerRow(id, { nativeOnly: localOnly, strict: localOnly });
+    async forgetRunner(app, id, { localOnly = false, adapterId = '' } = {}) {
+      const row = await findRunnerRow(id, { nativeOnly: localOnly, strict: localOnly,
+        adapterId: localOnly ? adapterId : '', metadataOnly: true });
       if (!row) return { ok: false, notFound: true, reason: '这条会话不在执行底座的运行记录里' };
+      if (['starting', 'running', 'streaming', 'queued', 'waiting', 'waiting-user'].includes(row.state))
+        return { ok: false, reason: '这条会话还在执行，完成或停止后再删除' };
       if (!localOnly && row.cloud && externalHistory) return externalHistory.forget(id);
       const adapter = historyAdapters.find(item => item && item.id === row.adapterId);
       if (!adapter || typeof adapter.forgetSession !== 'function') {

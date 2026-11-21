@@ -482,7 +482,9 @@ def _items_from(m: dict, run=None) -> list[dict]:
     part = m.get("part")
     # OpenCode event types include text, tool_use, step_start, and step_finish.
     if isinstance(part, dict):
-        if m.get("type") == "text" and (part.get("text") or "").strip():
+        if m.get("type") == "plan" and isinstance(part.get("text"), str):
+            items.append({"kind": "step", "tool": "Plan", "text": part["text"][:600], "full": part["text"][:20000]})
+        elif m.get("type") == "text" and (part.get("text") or "").strip():
             _t = part["text"].strip()
             # Bound text for the live activity display.
             # Plan extraction reads the same events but needs complete responses.
@@ -502,9 +504,10 @@ def _items_from(m: dict, run=None) -> list[dict]:
             # Do not repeat the tool name inside display text.
             # The UI renders tool and argument text separately.
             items.append({"kind": "do", "tool": str(part.get("tool") or ""),
-                          "text": str(brief)[:300], "callId": str(part.get("callId") or part.get("id") or ""),
+                          "text": str(brief)[:300], "callId": str(part.get("callID") or part.get("callId") or part.get("id") or ""),
                           "toolKind": str(part.get("toolKind") or "")[:40],
                           "arguments": runtime_messages.short_arguments(inp)})
+            items.extend(runtime_messages.native_tool_results(run or {}, m))
         return items
     # Pi event parsing.
     # message_update wraps thinking, text, and tool-call assistant events.
@@ -550,12 +553,17 @@ def _items_from(m: dict, run=None) -> list[dict]:
             message = str(it["message"])
             if not _CODEX_TRANSPORT_NOISE.search(message):
                 items.append({"kind": "out", "tool": "提示", "text": message[:300]})
+        elif it_type == "todo_list":
+            text = "\n".join(str(entry.get("text") or "") for entry in it.get("items") or [] if isinstance(entry, dict))
+            if text:
+                items.append({"kind": "step", "tool": "Plan", "text": text[:600], "full": text[:20000]})
         elif it_type:
             # Use a conservative fallback for other item types.
             # Display the type and bounded known fields, never an unbounded full item.
             brief = (it.get("command") or it.get("path") or it.get("text") or "")
             items.append({"kind": "do", "tool": it_type, "text": str(brief)[:300],
                           "callId": str(it.get("id") or ""), "arguments": runtime_messages.short_arguments(it)})
+            items.extend(runtime_messages.native_tool_results(run or {}, m))
         return items
     # Top-level Codex error messages may describe reconnect attempts and remain activity output.
     # turn.failed carries the terminal error through the common failure path.

@@ -166,6 +166,8 @@ const _ordinaryConversations = _piSessionIpc.install({ app, ipcMain, BrowserWind
   sendIdentityOf: _deviceAuth.authenticatedIdentity,
   capabilityGrantsOf: _runnerRuntime.capabilityGrants,
   authorizeAI: _authorizeAI, onQuotaExceeded: _onQuotaExceeded });
+require('./main/device-direct-install.cjs').install({ app, ipcMain, BrowserWindow, dialog, safeStorage,
+  deviceAuth: _deviceAuth, getRendererRoot: rendererRoot, conversation: _ordinaryConversations, session: _piSessions });
 _clientUpdater.install({ app, ipcMain, dialog: require('electron').dialog, BrowserWindow,
   shell: require('electron').shell,
   identityOf: _sessionIdentity, getWindow: () => _desktopOverlay.window,

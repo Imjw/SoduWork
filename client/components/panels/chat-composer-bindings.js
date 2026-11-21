@@ -6,9 +6,11 @@
   function createDraftControls(ctx) {
     let destroyed = false, loaded = false, loading = null, loadGeneration = 0, catalog = [], missing = [], defaultMode = 'standard', error = '';
     let choiceScope = null, preferenceVersion = 0;
-    const active = () => !destroyed && !ctx._ref && (!ctx._sessionId || ctx._snap?.workOnly === true);
-    const scope = () => ({epoch:ctx._viewEpoch, sessionId:ctx._sessionId});
-    const matches = value => active() && value?.epoch === ctx._viewEpoch && value.sessionId === ctx._sessionId;
+    const devicePreview = () => ctx._snap?.execution?.canContinueOnDevice === true;
+    const active = () => !destroyed && (devicePreview() || !ctx._ref && (!ctx._sessionId || ctx._snap?.workOnly === true));
+    const owner = () => ctx._draftOwnerScope?.() || '';
+    const scope = () => ({epoch:ctx._viewEpoch, sessionId:ctx._sessionId, owner:owner()});
+    const matches = value => active() && value?.epoch === ctx._viewEpoch && value.sessionId === ctx._sessionId && value.owner === owner();
     const api = () => ctx._api?.() || global.soduWorkAPI?.conversationSession;
     const paint = () => { if (active()) ctx._paintBar?.(); };
     const say = message => { if (active()) global.petSay?.(message); };
@@ -47,13 +49,24 @@
       discardStaleChoice();
       if (!active()) return {};
       if (!loaded && !loading) void load();
+      if (devicePreview() && loaded && !error && catalog.some(item => item.id === 'pi') &&
+          !catalog.some(item => item.id === ctx._sessionOptions.adapterId)) {
+        ctx._sessionOptions.adapterId = 'pi'; ctx._sessionOptions.modelName = ''; ctx._sessionOptions.modelLabel = '';
+        ctx._sessionOptions.reasoningEffort = ''; ctx._sessionOptions.thinkingLevel = '';
+        ctx._snap = { ...ctx._snap, modelSelection: null };
+      }
       const adapterId = ctx._sessionOptions.adapterId || 'pi', runtime = catalog.find(item => item.id === adapterId);
-      const mode = ctx._sessionOptions.accessMode || (ctx._sessionOptions.mode === 'readonly' ? 'readonly' : defaultMode);
-      return {draftOnly:true, draftId:ctx._sessionId || 'new:' + ctx._viewEpoch, adapterId, displayName:runtime?.displayName || ctx._sessionOptions.displayName,
-        accessPolicy:runtime?.accessControl?.supported && runtime.accessControl.modes?.includes(mode) ? {mode} : null,
-        nextAccessPolicy:null, accessControl:runtime?.accessControl || null,
+      const mode = ctx._sessionOptions.accessMode || (ctx._sessionOptions.mode === 'readonly' ? 'readonly' :
+        devicePreview() && defaultMode === 'full' ? 'standard' : defaultMode);
+      const selection = ctx._snap?.modelSelection;
+      const access = runtime?.accessControl;
+      const accessControl = devicePreview() && Array.isArray(access?.modes)
+        ? { ...access, modes: access.modes.filter(value => value === 'readonly' || value === 'standard') } : access;
+      return {draftOnly:true, devicePreview:devicePreview(), draftId:ctx._sessionId || 'new:' + ctx._viewEpoch, adapterId, displayName:runtime?.displayName || ctx._sessionOptions.displayName,
+        accessPolicy:accessControl?.supported && accessControl.modes?.includes(mode) ? {mode} : null,
+        nextAccessPolicy:null, accessControl:accessControl || null,
         draftAccessHint:ctx._workCards?.draftSelectionError?.() || error || (!loaded ? '正在读取执行选项…' : ''),
-        selection:ctx._snap?.modelSelection || {name:ctx._sessionOptions.modelName || '',
+        selection:(selection && (!devicePreview() || selection.name || selection.model?.unavailable) ? selection : null) || {name:ctx._sessionOptions.modelName || '',
           model:ctx._sessionOptions.modelName ? {id:ctx._sessionOptions.modelName,
             label:ctx._sessionOptions.modelLabel || ctx._sessionOptions.modelName} : null},
         ...(adapterId === 'codex' ? {thinking:{level:ctx._sessionOptions.reasoningEffort || ''}} : {})};
@@ -73,7 +86,7 @@
       selectThinking(level) { return active() && ctx._sessionOptions.adapterId === 'codex'
         ? {ok:true,thinking:{level,enabled:true,supported:true}} : {ok:false,reason:'会话已变化，请重新选择推理强度'}; },
       async chooseAccess(mode, adapterId, anchor) {
-        if (!active() || !consent) return false;
+        if (!active() || !consent || (devicePreview() && mode === 'full')) return false;
         discardStaleChoice();
         const requested = choiceScope = scope(), oldDraft = ctx._sessionOptions.accessDraftId;
         if (mode === 'full' && ctx._sessionOptions.accessMode === 'full' && ctx._sessionOptions.accessConsentId) return true;
@@ -88,6 +101,12 @@
         if (!active()) return true;
         const requested = scope();
         if (!await (consent?.ready() || true) || !matches(requested)) return false;
+        if (devicePreview()) {
+          if (!loaded) await load();
+          if (!matches(requested) || error) return false;
+          ctx._sessionOptions.accessMode ||= defaultMode === 'readonly' ? 'readonly' : 'standard';
+          return true;
+        }
         const saved = await (ctx._workCards?.ensureDraftSelectionSaved?.() ?? true);
         return saved && matches(requested);
       },
@@ -418,7 +437,8 @@ function _bind(el) {
     const draftControls = createDraftControls(ctx);
     if (global.ChatComposerControls) ctx._composerControls = ChatComposerControls.create(el, {
       draft: draftControls,
-      state: () => ({ ref: ctx._ref, adapterId: ctx._snap?.adapterId || ctx._sessionOptions.adapterId || 'pi', displayName: ctx._snap?.displayName || ctx._sessionOptions.displayName, model: ctx._model,
+      state: () => ({ ref: ctx._ref, readOnlyHistory: !!ctx._snap?.localReplica && !ctx._snap.execution?.canContinueOnDevice,
+        adapterId: ctx._snap?.adapterId || ctx._sessionOptions.adapterId || 'pi', displayName: ctx._snap?.displayName || ctx._sessionOptions.displayName, model: ctx._model,
         mode: ctx._mode, accessPolicy: ctx._snap?.accessPolicy, nextAccessPolicy: ctx._snap?.nextAccessPolicy, accessControl: ctx._snap?.accessControl || ctx._sessionOptions.accessControl,
         selection: ctx._snap && ctx._snap.modelSelection, thinking: ctx._snap && ctx._snap.thinking,
         taskRuntime: ctx._activeCollabTaskId && !(ctx._sessionOptions.acceptanceSession || ctx._sessionOptions.acceptanceExecutionSession) &&
@@ -444,7 +464,7 @@ function _bind(el) {
         ctx._sessionOptions.modelLabel = result.snapshot?.modelSelection?.model?.label || ctx._sessionOptions.modelName;
         if (draft) { ctx._sessionOptions.reasoningEffort = ''; ctx._sessionOptions.thinkingLevel = ''; }
         ctx._model = result.snapshot?.modelSelection?.model || null;
-        if (draft) void ctx._workCards?.saveDraftSelection?.(); ctx._render(); },
+        if (draft && ctx._snap?.workOnly) void ctx._workCards?.saveDraftSelection?.(); ctx._render(); },
       modelSelected: selection => { const draft = draftControls.active();
         if (draft && ctx._sessionOptions.modelName !== selection.name) {
           ctx._sessionOptions.reasoningEffort = ''; ctx._sessionOptions.thinkingLevel = '';
@@ -452,7 +472,7 @@ function _bind(el) {
         if (ctx._snap) ctx._snap.modelSelection = selection;
         ctx._sessionOptions.modelName = selection.name;
         ctx._sessionOptions.modelLabel = selection.model?.label || selection.name;
-        if (draft) void ctx._workCards?.saveDraftSelection?.(); ctx._render(); },
+        if (draft && ctx._snap?.workOnly) void ctx._workCards?.saveDraftSelection?.(); ctx._render(); },
       modelAvailabilityChanged: selection => {
         if (ctx._snap) ctx._snap.modelSelection = selection;
         ctx._render();
@@ -461,7 +481,7 @@ function _bind(el) {
         if (draftControls.active()) {
           if (ctx._sessionOptions.adapterId === 'codex') ctx._sessionOptions.reasoningEffort = thinking.level || '';
           else ctx._sessionOptions.thinkingLevel = thinking.level || '';
-          void ctx._workCards?.saveDraftSelection?.(); }
+          if (ctx._snap?.workOnly) void ctx._workCards?.saveDraftSelection?.(); }
         if (ctx._composerControls && typeof ctx._composerControls.render === 'function') ctx._composerControls.render(); },
     });
     el.querySelector('[data-chat-requirement]')?.addEventListener('click', () => { void ctx._openTaskPicker(); });

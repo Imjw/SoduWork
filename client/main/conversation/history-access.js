@@ -102,6 +102,12 @@ function classify(app, id, row, metadata) {
           if (!ids.has(part.sessionId)) { ids.add(part.sessionId); pending.push(part.sessionId); }
         }
       }
+      const memory = metadata('session-memory-bindings', current);
+      if (memory && (memory.historyProtection === 'account' || !Array.isArray(memory.ids) || memory.ids.length)) {
+        if (typeof memory.owner !== 'string' || !memory.owner) return result('unknown', true);
+        protectedData = true;
+        authority.push(memory.owner);
+      }
       for (const directory of ['requirement-session-context', 'acceptance-session-context']) {
         const value = metadata(directory, current);
         if (value) {
@@ -123,7 +129,7 @@ function classify(app, id, row, metadata) {
         ? (metadata.protection ? metadata.protection(current) : require('./work-conversation-cards').protection(app, current)) : null;
       if (forms) {
         if (forms.invalid || forms.unknown && (typeof forms.owner !== 'string' || !forms.owner)) return result('unknown', true);
-        if (forms.hasRequirement || forms.unknown) {
+        if (forms.hasRequirement || forms.hasPrivateCards || forms.unknown) {
           if (typeof forms.owner !== 'string' || !forms.owner) return result('unknown', true);
           protectedData = true; authority.push(forms.owner);
         }
@@ -208,7 +214,7 @@ function catalogChecker(app, captured, entries) {
   // bytes, even if a file changes and changes back while the query yields.
   const snapshotActor = { ...captured, readMetadata: metadata };
   return row => {
-    try { assertClassifiedReadable(app, row.id, snapshotActor, row, classify(app, row.id, row, metadata)); return true; }
+    try { assertClassifiedReadable(app, row.id, snapshotActor, row, classify(app, row.id, row, metadata), true); return true; }
     catch (_) { return false; }
   };
 }
@@ -264,8 +270,19 @@ function isOwnerlessNativeArchive(row) {
 function assertOwner(app, id, captured = actor(app), row = {}, options = {}) {
   return assertClassifiedOwner(app, id, captured, row, options, null);
 }
+function nativeOwners(row) {
+  if (row.historyNativeOwners === undefined) return [];
+  const owners = row.historyNativeOwners;
+  if (!Array.isArray(owners) || owners.length > 1001 ||
+      owners.some(owner => typeof owner !== 'string' || !/^[a-f0-9]{32}$/.test(owner)))
+    throw Error('无法读取会话归属记录，请重新打开 SoduWork');
+  return owners;
+}
 function assertClassifiedOwner(app, id, captured, row, options, classified) {
   if (!id || !captured.owner) throw Error('请先登录 SoduWork 后查看会话');
+  if (nativeOwners(row).some(owner => owner !== captured.owner &&
+      !runtime.scopeMatches(owner, captured.identity, captured.candidates)))
+    throw Error('这条会话属于另一个账号或服务，请切回原账号');
   // Account projections are authenticated Hub records, not ownerless native archives.
   if (row.accountProjection === true) {
     if (row.accountConversation !== true || row.adapterId !== 'account-sync' ||
@@ -346,7 +363,32 @@ function assertClassifiedOwner(app, id, captured, row, options, classified) {
 function assertReadable(app, id, captured = actor(app), row = {}) {
   return assertClassifiedReadable(app, id, captured, row, null);
 }
-function assertClassifiedReadable(app, id, captured, row, classified) {
+function assertDeviceReadable(app, id, captured = actor(app), row = {}) {
+  return assertClassifiedReadable(app, id, captured, row, null, true);
+}
+function isDeviceChat(row, classification) {
+  return classification.kind === 'ordinary' && !row.deviceTransferId && !row.importedHistory &&
+    !row.importDigest && !row.sourceSessionId && !row.sourceClientId && !row.sourceLocalId &&
+    (!row.location || row.location === 'local') && (!row.locationMode || row.locationMode === 'local');
+}
+function requestsAccountContext(options) {
+  return Boolean(options.taskRef || options.taskId || options.taskSession || options.requireTaskBinding ||
+    options.taskExecution || options.acceptanceSession || options.acceptanceExecutionSession ||
+    options.reworkSession || options.projectId || options.repoId || options.memoryIds?.length ||
+    options.plugins?.length || options.pluginIds?.length || options.initialPlugins?.length ||
+    options.skills?.length || options.libraryItemIds?.length || options.contextPrompts?.length ||
+    options.pluginEditId || options.appRequestId || options.nativeRelay || options.nativeRelayGuard ||
+    options.intent === 'goal' || options.mode === 'goal' || options.goal || options.acceptance);
+}
+function usesDeviceChatContext(app, options, indexedRow, nativeRow) {
+  if (requestsAccountContext(options)) return false;
+  if (!options.chatId) return !options.cloud && !options.remoteProjection && !options.accountProjection &&
+    !options.accountConversation && (!options.locationMode || options.locationMode === 'local');
+  if (!indexedRow || indexedRow.workOnly || nativeRow?.workOnly) return false;
+  const row = require('./history-evidence.cjs').mergeNativeEvidence(indexedRow, nativeRow);
+  return isDeviceChat(row, classifyLocal(app, indexedRow.id, row));
+}
+function assertClassifiedReadable(app, id, captured, row, classified, desktop = false) {
   if (!id || typeof id !== 'string' || id.length > 512 || (row.id || row.sessionId) !== id)
     throw Error('会话标识无效');
   if (!captured.readScope) throw Error('请先登录 SoduWork 后查看会话');
@@ -359,17 +401,21 @@ function assertClassifiedReadable(app, id, captured, row, classified) {
     return assertClassifiedOwner(app, id, captured, row, {}, local);
   const hub = new URL(captured.identity.hub).origin;
   const provenance = row.creator || (row.cached && row.source?.account ? row.source : null);
+  // Desktop sharing applies only to native rows. Transfers, imports and remote
+  // locators keep their original account boundary even when stored locally.
+  const deviceChat = desktop && isDeviceChat(row, local);
+  const creatorOwner = provenance?.account && crypto.createHash('sha256').update('soduwork-account\0' + provenance.account).digest('hex').slice(0, 32);
   let proven = false;
   if (provenance) {
-    const owner = provenance.account && crypto.createHash('sha256').update('soduwork-account\0' + provenance.account).digest('hex').slice(0, 32);
-    if (owner !== captured.owner || origin(provenance.hub) !== hub)
+    if (!creatorOwner || (!deviceChat && creatorOwner !== captured.owner) || origin(provenance.hub) !== hub)
       throw Error('这条会话属于另一个账号或服务，请切回原账号');
     proven = true;
   }
   // Check all persisted aliases for conflicting owners. Missing aliases do not
   // create ownership; immutable capture/import provenance can own a read-only copy.
-  const owners = row.workOwner ? [row.workOwner] : [];
-  for (const alias of new Set([id, ...(row.historyAliasIds || [])])) {
+  const owners = [...nativeOwners(row)];
+  if (row.workOwner) owners.push(row.workOwner);
+  for (const alias of deviceChat ? local.ids : new Set([id, ...(row.historyAliasIds || [])])) {
     const indexed = captured.ownership?.(alias) || local.ownership(alias);
     const records = indexed ? indexed.records.slice() : ['session-memory-bindings', 'requirement-session-context', 'conversation-runtime-segments']
       .map(directory => saved(app, directory, alias)).filter(Boolean);
@@ -385,6 +431,14 @@ function assertClassifiedReadable(app, id, captured, row, classified) {
       }
     }
   }
+  if (deviceChat && proven) {
+    const originalOwners = new Set(creatorOwner ? [creatorOwner, ...owners] : owners);
+    const [owner] = originalOwners;
+    if (originalOwners.size === 1 && /^[a-f0-9]{32}$/.test(owner) &&
+        owner !== captured.owner && !runtime.scopeMatches(owner, captured.identity, captured.candidates))
+      return { sharedOnDevice: true, originalOwner: owner };
+  }
+  if (creatorOwner && creatorOwner !== captured.owner) throw Error('这条会话属于另一个账号或服务，请切回原账号');
   if (owners.some(owner => !owner || owner !== captured.owner && !runtime.scopeMatches(owner, captured.identity, captured.candidates)))
     throw Error('这条会话属于另一个账号或服务，请切回原账号');
   // Older environment fingerprints can prove their original Hub without
@@ -413,15 +467,21 @@ function readScope(identity, trustedOwner = '') {
   return /^[a-f0-9]{32}$/.test(owner) && hub ? crypto.createHash('sha256').update(JSON.stringify([hub, owner])).digest('hex') : '';
 }
 function assertLocalMutation(app, id, captured = actor(app), row = {}) {
-  if (classifyLocal(app, id, row).kind !== 'ordinary' &&
+  const local = classifyLocal(app, id, row);
+  if (local.kind !== 'ordinary' &&
       (!captured.owner || runtime.scope(captured.identity) !== captured.owner))
     throw Error('请先登录 SoduWork 后查看会话');
-  assertReadable(app, id, captured, row);
+  assertClassifiedReadable(app, id, captured, row, local);
 }
-function visible(app, rows, identity) {
+function authorizedRows(app, rows, identity, desktop = false) {
   const captured = actor(app, identity), metadata = metadataReader(app, true);
-  return filterVisible(app, rows, captured, row => classify(app, row.sessionId || row.id, row, metadata));
+  return filterVisible(app, rows, captured, row => classify(app, row.sessionId || row.id, row, metadata), desktop);
 }
+const publicRow = ({ workOwner, historyNativeOwners, ...row }) => row;
+function visible(app, rows, identity, desktop = false) {
+  return authorizedRows(app, rows, identity, desktop).map(publicRow);
+}
+const visibleOnDevice = (app, rows, identity) => visible(app, rows, identity, true);
 async function visibleAsync(app, rows, identityOf) {
   const metadata = metadataReader(app, true), classified = new Map();
   for (let index = 0; index < rows.length; index++) {
@@ -431,17 +491,17 @@ async function visibleAsync(app, rows, identityOf) {
   }
   // Metadata discovery may yield to an account switch. Apply its authority only
   // once all batches are ready, using the identity that will receive the page.
-  return filterVisible(app, rows, actor(app, identityOf()), row => classified.get(row));
+  return filterVisible(app, rows, actor(app, identityOf()), row => classified.get(row)).map(publicRow);
 }
-function filterVisible(app, rows, captured, classification) {
+function filterVisible(app, rows, captured, classification, desktop = false) {
   return rows.filter(row => {
     try {
       const id = row.sessionId || row.id;
-      assertClassifiedReadable(app, id, captured, row, classification(row));
+      assertClassifiedReadable(app, id, captured, row, classification(row), desktop);
       return true;
     }
     catch (_) { return false; }
-  }).map(row => { const { workOwner, ...visible } = row; return visible; });
+  });
 }
 function assertLocalCurrent(app, captured, row, identity) {
   assertCurrent(app, captured, identity);
@@ -455,4 +515,5 @@ function assertCurrent(app, captured, identity) {
     throw Error('账号已切换，请在当前账号重新打开会话');
 }
 module.exports = { assertLocalCurrent, assertLocalMutation, actor, assertOwner, assertReadable, assertCurrent,
-  visible, visibleAsync, isOwnerlessNativeArchive, classifyLocal, catalogChecker, readScope };
+  assertDeviceReadable, usesDeviceChatContext, requestsAccountContext, visible, visibleOnDevice,
+  authorizedRows, visibleAsync, isOwnerlessNativeArchive, classifyLocal, catalogChecker, readScope };

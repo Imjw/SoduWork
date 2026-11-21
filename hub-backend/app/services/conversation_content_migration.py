@@ -39,8 +39,9 @@ async def assert_actor(session, captured):
 async def account(session, client, row, target_client_id):
     captured_actor = actor(client)
     from ..api import desktop_capabilities, account_conversations
-    if row.owner_user_id != client.user_ref:
-        raise HTTPException(403, "会话不属于当前账号")
+    if (row.owner_user_id != client.user_ref or row.source_client_id != client.id
+            or target_client_id != client.id or client.auth_state != "active"):
+        raise HTTPException(403, "旧会话仅能恢复到原来源电脑")
     _, endpoint = await desktop_capabilities.resolve(session, client, target_client_id)
     if "desktopHistory1" not in endpoint.caps:
         raise HTTPException(409, "请更新目标电脑客户端后迁移")
@@ -64,7 +65,7 @@ async def account(session, client, row, target_client_id):
         raise HTTPException(409, "本地副本尚未完整保存，Hub 原文已保留")
     current = await session.scalar(select(AccountConversation).where(
         AccountConversation.id == identity).with_for_update().execution_options(populate_existing=True))
-    if (not current or current.owner_user_id != client.user_ref
+    if (not current or current.owner_user_id != client.user_ref or current.source_client_id != client.id
             or (current.source_revision, current.revision, current.deleted, current.archived) != version):
         raise HTTPException(409, "迁移期间会话已更新，原文已保留，请重试")
     await assert_actor(session, captured_actor)
@@ -176,8 +177,9 @@ async def pending_message(session, client, row):
 async def relay(session, client, row):
     captured_actor = actor(client)
     from ..api import desktop_capabilities
-    if row.owner_user_id != client.user_ref:
-        raise HTTPException(403, "消息不属于当前账号")
+    if (row.owner_user_id != client.user_ref or row.source_client_id != client.id
+            or client.auth_state != "active"):
+        raise HTTPException(403, "旧消息仅能恢复到原来源电脑")
     if not row.instruction:
         return {"ok": True, "alreadyMigrated": True}
     captured = fingerprint([row.instruction, row.phase, row.owner_user_id])
@@ -186,7 +188,8 @@ async def relay(session, client, row):
                                                  {"instruction": row.instruction}, session=session)
     current = await session.scalar(select(PersonalConversationRelay).where(PersonalConversationRelay.id == row.id)
         .with_for_update().execution_options(populate_existing=True))
-    if not current or captured != fingerprint([current.instruction, current.phase, current.owner_user_id]):
+    if (not current or current.source_client_id != client.id
+            or captured != fingerprint([current.instruction, current.phase, current.owner_user_id])):
         raise HTTPException(409, "迁移期间接力状态已更新，原文已保留")
     await assert_actor(session, captured_actor)
     current.content_ref, current.instruction = pointer, ""

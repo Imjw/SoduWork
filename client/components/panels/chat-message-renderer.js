@@ -414,6 +414,12 @@
   function _render() {
     const el = ctx._mount();
     if (!el) return;
+    const input = el.querySelector('#nchatInput');
+    const viewOnly = ctx._snap?.localReplica === true && ctx._snap.execution?.canContinueOnDevice !== true;
+    if (input && input.disabled !== viewOnly) {
+      input.disabled = viewOnly;
+      input.placeholder = viewOnly ? '这条历史当前仅可查看' : '接着说…';
+    }
     global.ChatCloudHandoff?.sync(el, ctx._snap);
     global.AccessControls?.sync(el, ctx._ref, ctx._snap, ctx.esc, button =>
       ctx._answerUi('permission', button.dataset.uiValue, button));

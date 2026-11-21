@@ -67,6 +67,9 @@ function _contextSnapshot(handle, snapshot) {
 }
 function _send(win, handle, touched, snapshot, includeSnapshot, presenceSnapshot) {
   if (!win || win.isDestroyed()) return;
+  // A passive preview has no runtime events. Its transcript is delivered only
+  // through the opener's authorized, paged snapshot calls.
+  if (handle.historyPreview) return;
   if (typeof _sessionOwners !== 'undefined' && _sessionOwners && !_sessionOwners.canAccess(handle)) return;
   const safePluginAuthorization = includeSnapshot && typeof eventPublication.pluginAuthorization === 'function'
     ? eventPublication.pluginAuthorization(touched?.pluginAuthorization) : undefined;
@@ -282,17 +285,12 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
   });
   if (app.isReady?.()) _cloudHandoff.synchronization.start();
   else app.on('ready', () => _cloudHandoff.synchronization.start());
-  const accountSyncStore = require('../conversation/account-sync-store').createWorker(
-    path.join(app.getPath('userData'), 'account-conversations-sync', 'outbox.json'));
-  _sharedHistory = require('../conversation/shared-history.cjs').create({ app, session });
+  _sharedHistory = require('../conversation/shared-history.cjs').create({ app, session, workRoot: () => workDir(app) });
   session.setReplicaHistory?.(_sharedHistory);
+  // Native conversations stay on this device, including their directory metadata.
+  // Do not open the legacy outbox: startup replay would publish old PC history.
   _accountSync = require('../conversation/account-sync').create({
-    app, store: accountSyncStore, identityOf: sendIdentityOf || identityOf,
-    localIdentityOf: async () => (sendIdentityOf || identityOf)(app),
-    resolveNativeSource: (item, identity) => require('../conversation/account-native-source.cjs').resolve({ app, session, item, identity }),
-    resolveDisplayLinks: (items, identity) => _sharedHistory.accountDisplayLinks(items, identity),
-    realtime: true, metadataOnly: true,
-    preserveLegacyOutbox: (job, identity) => _sharedHistory.preserveLegacyOutbox(job, identity),
+    app, enabled: false,
   });
   const localRequirementParse = require('../local-requirement-parser.cjs').createLocalRequirementParser({
     app, identityOf: sendIdentityOf || identityOf,
@@ -333,20 +331,16 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
       // while the best-effort realtime repaint is in flight.
     }
   });
-  // The bridge historically accepted one external history provider. Keep the
-  // cloud handoff provider and add the account projection without changing the
-  // cloud authority or exposing account sync as a Runner.
+  // Only Hub-managed cloud conversations participate in account history.
+  // Explicit selected-device history uses the guarded capability service below.
   session.setExternalHistory?.({
     historyEntry(id) { return _cloudHandoff.historyEntry?.(id) || null; },
     async history(options) {
-      const [cloud, account] = await Promise.allSettled([_cloudHandoff.history(options), _accountSync.history(options)]);
-      const rows = [];
-      if (cloud.status === 'fulfilled') rows.push(...(cloud.value.chats || []));
-      if (account.status === 'fulfilled') rows.push(...(account.value.chats || []));
+      const cloud = await _cloudHandoff.history(options);
       const seen = new Set();
-      return { ok: true, chats: require('../conversation/account-sync').linkCloudHistory(rows)
+      return { ...cloud, chats: (cloud.chats || [])
         .filter(row => row && row.id && !seen.has(row.id) && seen.add(row.id)),
-        lifecycle: account.status === 'fulfilled' ? account.value.lifecycle || [] : [] };
+        lifecycle: cloud.lifecycle || [] };
     },
     isRemote(id) { return typeof _cloudHandoff.isRemote === 'function' && _cloudHandoff.isRemote(id); },
     forget(id) {
@@ -368,7 +362,10 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
   _usage.flush().catch(() => {});
   const pluginDebug = require('../personal-plugin-debug-ipc').install({
     app, ipcMain, session, identityOf: sendIdentityOf || identityOf, skillDirs: () => skillRoots.discover(app),
-    assertOwner: (identity, handle) => memories.assertOwner(identity, handle.sessionId),
+    assertOwner: (identity, handle) => {
+      require('../conversation/device-local-continuation.cjs').guard(handle, identity, { plugins: ['private-plugin'] });
+      memories.assertOwner(identity, handle.sessionId);
+    },
     deviceGrants: () => capabilityGrantsOf ? capabilityGrantsOf(app) : [],
     managedInputsRoot: () => path.join(workDir(app), 'temp'),
   });
@@ -454,6 +451,22 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
         ? await _sharedHistory.resolve(opts.chatId) : null;
       const local = resolvedLocal && require('../conversation/shared-history.cjs').isLocalIdentity(resolvedLocal, opts.chatId)
         ? resolvedLocal : null;
+      const desktopContinuation = Boolean(event && preferences.isTrusted(event) && !opts.nativeRelay &&
+        !automationContext && !expectedIdentity && !appPluginId);
+      const deviceContinuation = desktopContinuation && local && !local.cached
+        ? require('../conversation/device-local-continuation.cjs') : null;
+      const ordinaryDeviceHistory = desktopContinuation && local && !local.cached &&
+        historyAccess.usesDeviceChatContext(app, { chatId: local.id }, local);
+      const deviceHistoryIntent = ordinaryDeviceHistory && !historyAccess.requestsAccountContext(opts) &&
+        ['view', 'continue'].includes(opts.historyIntent)
+        ? opts.historyIntent : '';
+      const startDeviceSegment = deviceHistoryIntent === 'continue';
+      if (opts.historyIntent === 'continue' && (!startDeviceSegment || !_sharedHistory?.prepareContinuation))
+        return { ok: false, reason: '当前会话不支持从本机历史继续，请重新打开会话' };
+      // resolve() and isLocalIdentity() validated this native alias. Subsequent
+      // read and execution checks must all refer to the same logical archive.
+      if (deviceHistoryIntent) opts.chatId = local.id;
+      let continuationGrant = null;
       if (opts.chatId && !local && _sharedHistory) {
         // A filtered native identity must not fall through to the older
         // account-only execution check. Source locators for remote originals
@@ -463,23 +476,32 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
         if (require('../conversation/shared-history.cjs').isLocalIdentity(indexed, opts.chatId))
           return { ok: false, reason: '无法确认这条会话属于当前账号或服务，请切回原连接' };
       }
-      const openLocalHistory = async () => {
-        const captured = historyAccess.actor(app);
+      const openLocalHistory = async (historyPreview = false, allowContinuation = false, previewReason = '') => {
+        const captured = requestActor;
         if (local) {
           if (local.deleted) return { ok: false, notFound: true, reason: '这条会话已经不存在了' };
-          const old = session.findBySessionId(local.id);
+          historyAccess.assertCurrent(app, captured);
+          if (!desktopContinuation) historyAccess.assertOwner(app, local.id, captured, local);
+          const old = !historyPreview && session.findBySessionId(local.id);
           if (old?.inFlight?.()) return { ok: false, reason: '这条会话还在执行，完成或停止后再操作' };
           if (old && await old.close() === false) return { ok: false, reason: '会话仍在关闭，请稍后重试' };
-          const projection = await _sharedHistory.open(local.id);
+          const projection = await _sharedHistory.open(local.id, { historyPreview, allowContinuation, previewReason });
           if (projection) {
-            const handle = session.attachView(projection);
-            historyAccess.assertCurrent(app, captured);
-            if (captured.identity && captured.owner) _sessionOwners?.bind(handle, captured.identity,
-              { connection: true });
-            if (event) _attach(handle, require('../conversation/app-surfaces.cjs').forSender(BrowserWindow, event.sender));
-            else _detach(handle);
-            _wire(BrowserWindow, handle);
-            return _openReply(handle, { resumed: true, attached: true, localReplica: true });
+            let handle;
+            try {
+              historyAccess.assertCurrent(app, captured);
+              handle = session.attachView(projection, { historyPreview });
+              if (captured.identity && captured.owner) _sessionOwners?.bind(handle, captured.identity,
+                { connection: true });
+              if (event) _attach(handle, require('../conversation/app-surfaces.cjs').forSender(BrowserWindow, event.sender));
+              else _detach(handle);
+              _wire(BrowserWindow, handle);
+              return _openReply(handle, { resumed: true, attached: true, localReplica: true });
+            } catch (error) {
+              if (handle) await closeFailedOpen(handle);
+              else await projection.close?.();
+              throw error;
+            }
           }
         }
         return { ok: false, notFound: true, reason: '这条会话已经不存在了' };
@@ -488,26 +510,42 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
       let knownAccountProjection = false;
       if (local) {
         let executable = true;
-        try { historyAccess.assertOwner(app, opts.chatId, historyAccess.actor(app), local); }
+        try { (desktopContinuation ? historyAccess.assertDeviceReadable : historyAccess.assertOwner)(
+          app, opts.chatId, historyAccess.actor(app), local); }
         catch (_) { executable = false; }
-        if (local.deleted || local.cached || !executable ||
-            ['claude', 'harness2'].includes(local.adapterId)) return await openLocalHistory();
+        const blocked = session.deviceTransfer?.()?.blocked(local.id);
+        if (startDeviceSegment && (blocked || local.deleted || !executable))
+          return { ok: false, reason: '当前会话无法在此设备继续，请重新打开历史' };
+        if (deviceHistoryIntent === 'view') {
+          const live = session.findBySessionId(local.id);
+          const switching = require('../agent-runtime/switchable-conversation');
+          if (!live || live.localReplica || blocked ||
+              (!switching.busy(live) && !switching.goalSwitchBlocked(live.snapshot())))
+            return await openLocalHistory(true, executable && !blocked);
+        }
+        if (local.deleted || local.cached || !executable || blocked ||
+            (!startDeviceSegment && ['claude', 'harness2'].includes(local.adapterId))) return await openLocalHistory();
         // Canonical local identity wins over stale renderer projection flags.
         nativeLocal = true;
-        Object.assign(opts, { adapterId: local.adapterId || 'pi',
+        Object.assign(opts, { adapterId: startDeviceSegment ? raw.adapterId || 'pi' : local.adapterId || 'pi',
           accountConversation: false, accountProjection: false });
       }
       let identity;
       try { identity = await identityOf(app); }
       catch (error) {
-        if (local && !automationContext && !expectedIdentity) return await openLocalHistory();
+        if (local && !startDeviceSegment && !automationContext && !expectedIdentity) return await openLocalHistory();
         throw error;
       }
-      if (!identity && local && !automationContext && !expectedIdentity) return await openLocalHistory();
+      if (!identity && local && !startDeviceSegment && !automationContext && !expectedIdentity) return await openLocalHistory();
       appRequest?.assertActive();
       if (!identity) return { ok: false, reason: '这台电脑还没连上 SoduWork 后台（先打开桌宠登录一次）' };
       historyAccess.assertCurrent(app, requestActor, identity);
       const historyActor = historyAccess.actor(app, identity);
+      if (desktopContinuation && local && !local.cached)
+        continuationGrant = deviceContinuation.grant(app, local, identity, opts);
+      const assertContinuationOwner = (row = local) => continuationGrant
+        ? deviceContinuation.assert(continuationGrant, app, identity, opts.chatId)
+        : historyAccess.assertOwner(app, opts.chatId, historyActor, row);
       const openingConnection = connectionOf(identity);
       const assertHistoryCurrent = async connectionError => {
         const current = await identityOf(app);
@@ -517,6 +555,13 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
             (!openingConnection || connectionOf(current) !== openingConnection)) throw Error(connectionError);
         historyAccess.assertCurrent(app, historyActor, current);
         return current;
+      };
+      const verifiedDeviceHistory = async () => {
+        const verified = await _sharedHistory.prepareContinuation(local.id, { refresh: true });
+        await assertHistoryCurrent();
+        if (!historyAccess.usesDeviceChatContext(app, { chatId: local.id }, local, verified.row))
+          throw Error('这条历史的归属已变化，请重新打开会话');
+        return verified;
       };
       if (automationContext) automationAccess.assertCurrent(automationContext, identity);
       if (expectedIdentity && (!openingConnection || openingConnection !== connectionOf(expectedIdentity))) {
@@ -539,7 +584,7 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
           accountConversation: false, accountProjection: false });
       };
       const selectedLive = opts.chatId && session.findBySessionId(opts.chatId);
-      if (opts.chatId && (!selectedLive || selectedLive.adapterId === 'account-sync') &&
+      if (opts.chatId && !deviceHistoryIntent && (!selectedLive || selectedLive.adapterId === 'account-sync') &&
           typeof _accountSync !== 'undefined' && _accountSync?.isAccountConversation?.(opts.chatId)) {
         knownAccountProjection = true;
         const item = await _accountSync.row(opts.chatId);
@@ -584,18 +629,45 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
       }
       /* Reconnect to the existing in-memory session when opening active history; never start a duplicate runtime. */
       if (opts.chatId) {
-        const live = session.findBySessionId(opts.chatId);
+        const previous = continuationGrant && typeof runtimeSession !== 'undefined'
+          ? runtimeSession.findBySessionId(opts.chatId) : null;
+        if (previous && !session.findBySessionId(opts.chatId)) {
+          const switching = require('../agent-runtime/switchable-conversation');
+          if (switching.busy(previous) || switching.goalSwitchBlocked(previous.snapshot()))
+            return { ok: false, reason: '原账号的会话仍在执行或等待处理，请完成后再继续' };
+          // A different account gets a fresh runtime only after an idle handle
+          // has closed authoritatively. Never stop work or adopt its credentials.
+          if (!await closeFailedOpen(previous)) throw Error('原会话尚未完成关闭，请稍后重试');
+          await assertHistoryCurrent();
+        }
+        let live = session.findBySessionId(opts.chatId);
+        if (startDeviceSegment && live) {
+          const switching = require('../agent-runtime/switchable-conversation');
+          if (switching.busy(live) || switching.goalSwitchBlocked(live.snapshot()))
+            return { ok: false, reason: '会话仍在执行或等待处理，请完成后再继续' };
+          if (deviceContinuation.matchesLiveSelection(live, opts, identity, historyActor.owner)) {
+            await verifiedDeviceHistory();
+            if (session.findBySessionId(opts.chatId) !== live || switching.busy(live) ||
+                switching.goalSwitchBlocked(live.snapshot()) ||
+                !deviceContinuation.matchesLiveSelection(live, opts, identity, historyActor.owner))
+              throw Error('会话或模型选择已变化，请重新打开历史');
+          } else {
+            if (!await closeFailedOpen(live)) throw Error('原会话尚未完成关闭，请稍后重试');
+            await assertHistoryCurrent();
+            live = null;
+          }
+        }
         if (live) {
           try {
           // Reattaching a requirement projection must recheck Hub ownership;
           // an existing local view is not authority for remote access.
-          await _cloudHandoff.refreshTaskExecution?.(opts.chatId, true);
+          if (!deviceHistoryIntent) await _cloudHandoff.refreshTaskExecution?.(opts.chatId, true);
           // A live handle is already attached to this device and must keep the
           // strict memory binding check. Archived history is different: the
           // device session can be in the middle of renewal, so checking its
           // optional memory binding before locating the transcript would make
           // an otherwise valid conversation impossible to open.
-          memories.assertOwner(identity, opts.chatId);
+          if (!deviceContinuation?.guard(live, identity, opts)) memories.assertOwner(identity, opts.chatId);
           require('../conversation/requirement-context').assertOwner(app, live, identity);
           await require('../conversation/acceptance-session').attach(app, live, { resumed: true }, identity);
           await assertHistoryCurrent();
@@ -650,7 +722,7 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
         return { ok: false, code: 'ACCOUNT_HISTORY_UNAVAILABLE',
           reason: '账号会话暂时无法读取，请刷新历史后重试' };
       }
-      if (opts.chatId && typeof _cloudHandoff.reopen === 'function') {
+      if (opts.chatId && !deviceHistoryIntent && typeof _cloudHandoff.reopen === 'function') {
         const remote = await _cloudHandoff.reopen(opts.chatId,
           'cloud-' + require('node:crypto').randomUUID());
         if (remote) {
@@ -697,11 +769,32 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
       // The native consent dialog can outlive capability discovery. Observe a
       // rejection now; the awaited original promise still reports it below.
       capabilityPromise.catch(() => {});
-      let resume = null;
+      let resume = null, deviceHistoryRecovery = null;
       if (opts.chatId) {
         // Opening one identity must not refresh every adapter's sidebar first.
-        if (typeof session.archivedConversation === 'function') {
-          resume = await session.archivedConversation(app, opts.chatId);
+        try {
+          if (continuationGrant && !startDeviceSegment)
+            deviceHistoryRecovery = await deviceContinuation.prepare(continuationGrant, _sharedHistory, identity, session);
+          // A desktop caller omitting the navigation intent cannot bypass the
+          // same receipt check by asking for a legacy native resume.
+          if (!deviceHistoryRecovery && ordinaryDeviceHistory && _sharedHistory.prepareContinuation) {
+            const verified = await verifiedDeviceHistory();
+            if (startDeviceSegment) deviceHistoryRecovery = verified;
+          }
+        } catch (error) {
+          if (!startDeviceSegment && ['NATIVE_HISTORY_MISSING', 'HISTORY_INCOMPLETE', 'HISTORY_UNRESOLVED_TOOLS'].includes(error.code))
+            return await openLocalHistory(true);
+          throw error;
+        }
+        if (deviceHistoryRecovery) {
+          resume = { ...local, path: '', runtimeConversationId: '' };
+        } else if (local && !local.cached && _sharedHistory?.prepareContinuation) {
+          const restored = await require('../conversation/native-history-opening.cjs').resolve({ app, session,
+            history: _sharedHistory, row: local });
+          if (restored.readOnly) return await openLocalHistory();
+          resume = restored.resume; deviceHistoryRecovery = restored.recovery;
+        } else if (typeof session.archivedConversation === 'function') {
+          resume = await session.archivedConversation(app, opts.chatId, { strict: true });
         } else {
           const got = await session.history(app, Number.MAX_SAFE_INTEGER);
           resume = ((got && got.chats) || []).find((c) => c.id === opts.chatId) || null;
@@ -711,8 +804,7 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
           await capabilityPromise.catch(() => {});
           return { ok: false, notFound: true, reason: '这条对话找不到了（存档可能已被清理）' };
         }
-        const ownerOptions = {};
-        historyAccess.assertOwner(app, opts.chatId, historyAccess.actor(app, identity), resume, ownerOptions);
+        assertContinuationOwner(resume);
       }
       const workOpening = require('../conversation/work-conversation-opening');
       const work = workOpening.prepare(app, opts, resume, identity, preferences.isTrusted(event), session);
@@ -721,7 +813,7 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
         accessConsent = newChatAccess.reserve(event, work.accessOptions, expectedIdentity);
         delete opts.accessDraftId; delete opts.accessConsentId;
       }
-      if (resume?.adapterId && !work.first) opts.adapterId = resume.adapterId;
+      if (resume?.adapterId && !work.first && !startDeviceSegment) opts.adapterId = resume.adapterId;
       if (resume && (String(opts.adapterId || '').toLowerCase() === 'account-sync' ||
           resume.accountConversation === true || resume.accountProjection === true)) {
         return { ok: false, code: 'ACCOUNT_HISTORY_UNAVAILABLE',
@@ -748,12 +840,21 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
       const permitted = await workOpening.applyPolicy({ app, event, options: opts, resume, work, cwd,
         automationContext, accessConsent, BrowserWindow, confirmFullAccess });
       if (!permitted.ok) { await capabilityPromise.catch(() => {}); return permitted; }
+      if ((continuationGrant || startDeviceSegment) && deviceHistoryRecovery) {
+        const readOnly = opts.mode === 'readonly' || opts.accessMode === 'readonly';
+        opts.accessPolicy = require('../access-control/policy').create(readOnly ? 'readonly' : 'standard', cwd);
+      }
       // A per-chat scratch directory is not a reusable engineering workspace.
       const scratchRoot = path.resolve(workDir(app), 'temp');
       const memoryRelativeCwd = path.relative(scratchRoot, path.resolve(cwd));
       const scratchCwd = !memoryRelativeCwd || (!memoryRelativeCwd.startsWith('..' + path.sep) && memoryRelativeCwd !== '..' && !path.isAbsolute(memoryRelativeCwd));
-      const memoryOptions = { ...opts, cwd, workspaceExplicit: !scratchCwd, resumed: Boolean(resume) };
-      const memoryContextPromise = memories.context(identity, memoryOptions);
+      // Ordinary desktop chats must remain portable across local account switches
+      // even if this account has accumulated personal or organization memories.
+      const deviceChatContext = Boolean(continuationGrant || desktopContinuation &&
+        historyAccess.usesDeviceChatContext(app, opts, local, resume));
+      const memoryOptions = { ...opts, cwd, workspaceExplicit: !scratchCwd, resumed: Boolean(resume), deviceChatContext };
+      const memoryContextPromise = deviceChatContext ? Promise.resolve({ ids: [], items: [], prompt: '', scopes: [] })
+        : memories.context(identity, memoryOptions);
       // Start optional memory lookup alongside attachment/capability preparation.
       memoryContextPromise.catch(() => {});
       const inputDir = opts.cwd ? path.join(workDir(app), 'temp', ref, '.soduwork-inputs') : '';
@@ -786,12 +887,12 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
       const openingPromise = Promise.resolve().then(async () => {
         await assertHistoryCurrent();
         if (opts.chatId) {
-          const ownerOptions = {};
-          historyAccess.assertOwner(app, opts.chatId, historyActor, resume, ownerOptions);
+          assertContinuationOwner(resume);
         }
         accessConsent?.assertValid();
         return session.open({
         app, identity, cwd: spec.cwd, ref, runtimeConversationId: resume?.runtimeConversationId,
+        deviceHistoryRecovery, deviceContinuationGrant: continuationGrant, startDeviceSegment,
         workConversation: work.bootstrap,
         workConversationId: work.first ? resume.id : undefined,
         validateWorkConversation: work.first ? () => work.validate({ event, identityOf: sendIdentityOf || identityOf,
@@ -864,7 +965,7 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
         retainedHistoryId: local?.id,
         retainedExecutionFailure: (require('../conversation/execution-outcome.cjs').recover(local) || local)?.state === 'failed',
         /* SDK uses the validated directory; the archive path remains separate. */
-        resumeCwd: resume ? cwd : '',
+        resumeCwd: resume && !startDeviceSegment ? cwd : '',
         resumeAt: resume ? resume.at : 0,
         // Historical archives must paint immediately. Third-party extensions
         // are loaded serially by the SDK and one stalled extension used to
@@ -893,12 +994,20 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
         if (openingTimedOut) return { ok: false, reason: '执行底座初始化超过 45 秒没有响应，请重试' };
         throw error;
       }
-      if (!opened.ok) return opened;
+      if (!opened.ok) {
+        const unavailable = ['ADAPTER_NOT_FOUND', 'RUNNER_MODEL_UNAVAILABLE', 'LOCAL_HISTORY_MODEL_UNAVAILABLE'];
+        if (desktopContinuation && local && opts.historyIntent === 'view' && !work.first &&
+            !historyAccess.requestsAccountContext(opts) && unavailable.includes(opened.runtimeError || opened.code)) {
+          await assertHistoryCurrent();
+          historyAccess.assertOwner(app, local.id, historyActor, local);
+          return await openLocalHistory(true, false, '原执行底座或模型不可用，可查看此账号已保存的历史');
+        }
+        return opened;
+      }
       try {
         await assertHistoryCurrent();
         if (opts.chatId) {
-          const ownerOptions = {};
-          historyAccess.assertOwner(app, opts.chatId, historyActor, resume, ownerOptions);
+          assertContinuationOwner(resume);
         }
         await require('../conversation/acceptance-session').attach(app, opened.session,
           resume ? { resumed: true } : { ...opts, resumed: false }, identity);
@@ -911,7 +1020,11 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
           inputAttachments: staged.files,
           attachmentWarnings: staged.warnings,
         };
-        await memories.attach(opened.session, identity, memoryContext, [...spec.warnings, ...(opened.session.skillWarnings || [])], memoryOptions);
+        if (continuationGrant) {
+          deviceContinuation.bind(opened.session, continuationGrant);
+          opened.session.ui.memories = []; opened.session.ui.memoryScopes = [];
+          opened.session.ui.capabilityWarnings = [...spec.warnings, ...(opened.session.skillWarnings || [])];
+        } else await memories.attach(opened.session, identity, memoryContext, [...spec.warnings, ...(opened.session.skillWarnings || [])], memoryOptions);
         require('../conversation/requirement-context').assertOwner(app, opened.session, identity);
         accessConsent?.assertValid();
         await assertHistoryCurrent();
@@ -981,6 +1094,7 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
       const owner = s.usageIdentity;
       if (owner && (owner.hub !== identity.hub || owner.clientId !== identity.clientId))
         return { ok: false, reason: '账号或服务已变化，请重新打开这条对话' };
+      require('../conversation/device-local-continuation.cjs').guard(s, identity, { taskId: rawTaskId });
       memories.assertOwner(identity, s.sessionId);
       await require('../conversation/acceptance-session').attach(app, s, { resumed: true }, identity);
       require('../conversation/acceptance-session').assertTask(s, rawTaskId);
@@ -995,6 +1109,13 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
   });
 
   async function sendConversation(ref, text, rawAttachments, rawOptions, observe, appRequest) {
+    let release;
+    try { release = session.deviceTransfer?.()?.admit(session.get(ref)?.sessionId); }
+    catch (error) { return { ok: false, accepted: false, notSent: true, reason: error.message }; }
+    try { return await submitConversation(ref, text, rawAttachments, rawOptions, observe, appRequest); }
+    finally { release?.(); }
+  }
+  async function submitConversation(ref, text, rawAttachments, rawOptions, observe, appRequest) {
     appRequest?.assertActive();
     const skillTurn = require('./skill-turn');
     const maintenance = updateWorkloads.guard();
@@ -1023,7 +1144,8 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
       if (!current) return { ok: false, reason: '请先连接 SoduWork 服务并登录' };
       // Same-account environment changes do not invalidate access solely through usageIdentity's Hub and client fields.
       // Enforce account isolation through assertOwner fingerprints from memory and requirement bindings.
-      memories.assertOwner(current, s.sessionId);
+      if (!require('../conversation/device-local-continuation.cjs').guard(s, current, rawOptions))
+        memories.assertOwner(current, s.sessionId);
       require('../conversation/requirement-context').assertOwner(app, s, current);
       await require('../conversation/acceptance-session').attach(app, s, { resumed: true }, current);
       const acceptance = require('../conversation/acceptance-session').assertTask(s, rawOptions?.taskId);
@@ -1154,6 +1276,19 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
         authorizeAI, currentIdentity, sendOptions.beforeTurn, { agent, modelMode, controlled: Boolean(sendOptions.controlled),
           localModel: name => require('../local-model-store.cjs').resolve(name) });
     }
+    const localContinuation = require('../conversation/device-local-continuation.cjs');
+    if (localContinuation.tokenOf(s)) {
+      const previous = sendOptions.beforeTurn;
+      sendOptions.beforeTurn = async (...args) => {
+        const fresh = await (sendIdentityOf || identityOf)(app);
+        if (session.get(ref) !== s) throw Error('账号已切换，请重新打开会话');
+        localContinuation.guard(s, fresh, rawOptions);
+        const result = await previous?.(...args);
+        if (session.get(ref) !== s) throw Error('账号已切换，请重新打开会话');
+        localContinuation.guard(s, fresh, rawOptions);
+        return result;
+      };
+    }
     let workflowTurn;
     try {
       if (session.get(ref) !== s) throw Error('账号已切换，请重新打开会话');
@@ -1243,17 +1378,22 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
     const s = session.get(ref);
     if (!s) return { ok: false, reason: '\u4f1a\u8bdd\u4e0d\u5728\u4e86' };
     const win = BrowserWindow.fromWebContents(event.sender);
-    const attached = _uiWindow.request(s, win, options);
     if (s.localReplica) {
       const historyAccess = require('../conversation/history-access');
       const captured = historyAccess.actor(app);
-      historyAccess.assertReadable(app, s.sessionId, captured, s.historyRow());
+      const assertReadable = s.historyPreview === true && win && s.attachedWindow === win &&
+        require('../access-control/preferences').isTrusted(event)
+        ? historyAccess.assertDeviceReadable : historyAccess.assertReadable;
+      assertReadable(app, s.sessionId, captured, s.historyRow());
       return Promise.resolve(s.loadHistory?.(options || {})).then(() => {
-        historyAccess.assertCurrent(app, captured);
+        const current = historyAccess.actor(app);
+        historyAccess.assertCurrent(app, captured, current.identity);
         if (session.get(ref) !== s) throw Error('账号或会话已变化，请重新打开');
+        assertReadable(app, s.sessionId, current, s.historyRow());
         return { ok: true, snapshot: _contextSnapshot(s, s.snapshot()) };
       });
     }
+    const attached = _uiWindow.request(s, win, options);
     const raw = attached ? _uiWindow.snapshot(s) :
       (typeof s.uiSnapshot === 'function' ? s.uiSnapshot(options || {}) : s.snapshot());
     const snapshot = _contextSnapshot(s, raw);
@@ -1316,17 +1456,9 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
     return { ok: true, kept: true, active: _isActive(s), sessionId: s.sessionId };
   });
 
-  /* Close in-process sessions on application shutdown so they cannot keep the process alive. */
-  const personalRelay = require('../conversation/personal-relay').create({
-    app, identityOf: () => (sendIdentityOf || identityOf)(app),
-    find: id => session.findBySessionId(id),
-    open: (options, identity) => openConversation(null, options, identity),
-    send: sendConversation,
-    sync: () => _accountSync.flush(),
-  });
   let accountingQuitReady = false;
   const contentMigration = require('../conversation/content-migration.cjs').create({
-    app, identityOf: sendIdentityOf || identityOf });
+    app, identityOf: sendIdentityOf || identityOf, includeAccountHistory: false });
   contentMigration.start();
   let persistenceClose = null;
   const disposePersistence = () => {
@@ -1341,7 +1473,6 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
   app.on('before-quit', event => {
     const persisted = disposePersistence();
     void _cloudHandoff?.synchronization.close();
-    personalRelay.close();
     _publicationQueue.clear();
     _streamTransport.clear();
     _releaseTimers.forEach((t) => clearTimeout(t));
@@ -1360,6 +1491,8 @@ function install({ app, ipcMain, BrowserWindow, identityOf, sendIdentityOf, capa
   });
   return {
     dispose: disposePersistence,
+    deviceHistory: _sharedHistory,
+    setDeviceTransfer(controller) { session.setDeviceTransfer(controller); },
     history: require('./local-history-remote.cjs').create({ app, session, history: _sharedHistory,
       accountHistory: _accountSync,
       identityOf: sendIdentityOf || identityOf,

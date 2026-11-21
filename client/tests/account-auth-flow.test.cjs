@@ -266,3 +266,16 @@ test('logout notifies every live window after local invalidation before an offli
   assert.equal(result.ok, false); assert.match(result.error, /network unavailable/);
   assert.equal(f.auth.session(f.app), ''); assert.equal(sent.length, 2, 'late failure cannot emit a second state change');
 });
+
+test('optional peer enrollment stays in the background while an ordinary login completes', async t => {
+  const f = fixture(t);
+  let finishEnrollment;
+  const pendingEnrollment = new Promise(resolve => { finishEnrollment = resolve; });
+  const unregister = f.auth.onSessionIssued(() => pendingEnrollment);
+  t.after(() => { finishEnrollment(); unregister(); });
+  global.fetch = async url => url.endsWith('/clients/enroll') ? enrolled() :
+    response({ session: 'fixture-active-session', expiresIn: 600, user: { id: 'account-user' } });
+  const login = f.auth.login(f.app, { hub: f.hub, account: 'fixture-owner' });
+  const result = await Promise.race([login, new Promise(resolve => setImmediate(() => resolve(null)))]);
+  assert.equal(result?.ok, true);
+});

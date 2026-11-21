@@ -293,6 +293,7 @@ for (const actionId of ['work.automation.create', 'work.requirement.create']) {
     assert.ok(boundary > 0 && boundary < 8192);
     const header = JSON.parse(text.slice(0, boundary) + '}');
     assert.deepEqual(header.protection, { version: 1, owner: scope(f.current()),
+      ...(actionId === 'work.automation.create' ? { hasPrivateCards: true } : {}),
       hasRequirement: actionId === 'work.requirement.create' });
     assert.deepEqual(f.module.protection(f.app, made.sessionId), header.protection);
     const row = (await sessions.historyEntry(f.app, made.sessionId)).entry;

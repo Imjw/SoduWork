@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node scripts/start-client.cjs",
     "start:raw": "electron .",
-    "test": "node --test --test-concurrency=1 --test-timeout=120000 tests/*.test.cjs tests/*.test.js main/agent-runtime/*.test.js main/agent-runtime/*.test.cjs main/conversation/*.test.js main/pi-session/*.test.js main/conversation/*.test.cjs main/*.test.cjs",
+    "test": "node --test --test-concurrency=1 --test-timeout=120000 tests/*.test.cjs tests/*.test.js tests/integration/device-*.test.cjs main/agent-runtime/*.test.js main/agent-runtime/*.test.cjs main/conversation/*.test.js main/pi-session/*.test.js main/conversation/*.test.cjs main/*.test.cjs",
     "check:branding": "node ../tools/brand-keyword-gate.cjs",
     "check:layout": "node ../tools/check-repository-layout.cjs",
     "check:source-size": "node ../tools/check-source-size.cjs",

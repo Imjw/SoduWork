@@ -35,10 +35,10 @@ function createRunnerHistoryProvider({ app, adapterId, runnerRuntime: runtime = 
   }
   return Object.freeze({
     id: adapterId,
-    async historyEntry(id, { strict = false } = {}) {
+    async historyEntry(id, { strict = false, metadataOnly = false } = {}) {
       try {
         const row = (await _runnerInventory(runtime, { force: strict })).find(row => eligible(row) && row.ref === id);
-        return { ok: true, chats: row ? [await historyRow(row)] : [] };
+        return { ok: true, chats: row ? [await historyRow(row, metadataOnly)] : [] };
       } catch (error) { return failure(error); }
     },
     async history(limit = 50, { strict = false, metadataOnly = false } = {}) {

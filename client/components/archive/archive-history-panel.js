@@ -10,6 +10,7 @@
   const filters = { query: '', sort: 'updated' };
   let archiveChats = [];
   let archiveProjects = [];
+  let activeRead = null;
 
   function api() {
     return global.soduWorkAPI?.conversationSession || global.soduWorkAPI?.piSession || null;
@@ -175,16 +176,21 @@
       return rightAt - leftAt;
     });
   }
-  function renderFiltered() {
+  function renderFiltered({ preserveChats = false } = {}) {
     const list = document.getElementById('archiveHistoryList');
     const projectsList = document.getElementById('archiveProjectsList');
     const count = document.getElementById('archiveHistoryCount');
     if (!list || !projectsList) return;
-    list.replaceChildren(); projectsList.replaceChildren();
+    if (!preserveChats) list.replaceChildren();
+    projectsList.replaceChildren();
     const chats = sortRows(archiveChats.filter(matchesChat));
     const projects = sortRows(archiveProjects.filter(matchesProject), true);
+    if (preserveChats) {
+      const visible = new Set(chats.map(row => row.id));
+      for (const node of [...list.children]) if (!visible.has(node._archiveChatId)) node.remove();
+    }
     if (!chats.length) renderEmpty(list, filters.query ? '没有匹配的归档会话' : '还没有归档会话');
-    else chats.forEach(row => conversationRow(row, list));
+    else if (!preserveChats) chats.forEach(row => conversationRow(row, list));
     if (!projects.length) renderEmpty(projectsList, filters.query ? '没有匹配的归档项目' : '还没有归档项目');
     else projects.forEach(project => projectRow(project, projectsList));
     if (count) count.textContent = chats.length + ' 条会话 · ' + projects.length + ' 个项目';
@@ -192,12 +198,14 @@
   function isMissingResult(result) {
     return Boolean(result && (result.notFound || result.alreadyDeleted));
   }
-  async function runChatOperation(ids, operation, rollback, failureLabel) {
+  async function runChatOperation(ids, operation, rollback, failureLabel, current = () => true) {
     const completed = [];
     for (const id of ids || []) {
+      if (!current()) throw Error('账号或页面已变化，请重新打开归档');
       let result;
       try { result = await operation(id); }
       catch (error) { result = { ok: false, reason: String(error?.message || error) }; }
+      if (!current()) throw Error('账号或页面已变化，请重新打开归档');
       if (result?.ok) { completed.push(id); continue; }
       if (isMissingResult(result)) continue;
       if (rollback) {
@@ -210,6 +218,7 @@
   }
   function conversationRow(row, target) {
     const item = text('article', 'archive-history-item');
+    item._archiveChatId = row.id;
     const main = text('div', 'archive-history-item-main');
     main.append(text('strong', 'archive-history-item-title', row.title || tr('未命名对话')));
     const meta = text('div', 'archive-history-item-meta', [date(row.archivedAt || row.at), row.cwd || row.workdir || tr('本机对话')].join(' · '));
@@ -229,16 +238,19 @@
       } catch (error) { message(error.message || '恢复失败', true); actions.querySelectorAll('button').forEach(button => { button.disabled = false; }); }
     }));
     actions.append(iconAction('\u5220\u9664', 'archive-history-delete', async () => {
-      if (!await confirmPermanentDeletion('彻底删除这条会话？', '“{title}”以及它的本地会话记录将被永久删除，删除后无法恢复。', undefined, { title: row.title || tr('未命名对话') })) return;
+      const view = activeRead;
+      if (!view?.current()) return;
+      if (!await confirmPermanentDeletion('彻底删除这条会话？', '“{title}”以及它的本地会话记录将被永久删除，删除后无法恢复。', undefined, { title: row.title || tr('未命名对话') }) || !view.current()) return;
       actions.querySelectorAll('button').forEach(button => { button.disabled = true; });
       const store = projectStore();
       try {
         const got = await api()?.permanentDeleteHistory?.(row.id);
+        if (!view.current()) return;
         if (!got?.ok) throw Error(got?.reason || '彻底删除失败');
         store?.forget?.(row.id);
         message('已彻底删除对话');
-        await render();
-      } catch (error) { message(error.message || '彻底删除失败', true); actions.querySelectorAll('button').forEach(button => { button.disabled = false; }); }
+        view.remove([row.id, got.id, ...(got.aliasIds || [])]);
+      } catch (error) { if (view.current()) message(error.message || '彻底删除失败', true); actions.querySelectorAll('button').forEach(button => { button.disabled = false; }); }
     }));
     item.append(main, actions); target.appendChild(item);
   }
@@ -269,19 +281,21 @@
       } catch (error) { message(error.message || '恢复项目失败', true); actions.querySelectorAll('button').forEach(button => { button.disabled = false; }); }
     }));
     actions.append(iconAction('\u5220\u9664\u9879\u76ee', 'archive-history-delete', async () => {
-      if (!await confirmPermanentDeletion('彻底删除这个项目？', '“{name}”及其中的会话记录将被永久删除，删除后无法恢复。', '删除项目', { name: project.name || tr('未命名项目') })) return;
+      const view = activeRead;
+      if (!view?.current()) return;
+      if (!await confirmPermanentDeletion('彻底删除这个项目？', '“{name}”及其中的会话记录将被永久删除，删除后无法恢复。', '删除项目', { name: project.name || tr('未命名项目') }) || !view.current()) return;
       actions.querySelectorAll('button').forEach(button => { button.disabled = true; });
       try {
         const store = projectStore();
         const sessionApi = api();
         if (!sessionApi?.permanentDeleteHistory) throw Error('归档会话接口暂不可用，请重试');
-        await runChatOperation(project.chatIds, id => sessionApi.permanentDeleteHistory(id), null, '删除项目中的会话失败');
+        await runChatOperation(project.chatIds, id => sessionApi.permanentDeleteHistory(id), null, '删除项目中的会话失败', view.current);
         if (!store?.permanentlyDeleteProject) throw Error('项目数据暂不可用，请重试');
         store.permanentlyDeleteProject(project.id);
         global.WorkspaceShell?.refreshConversationHistory?.();
         message('已彻底删除项目');
-        await render();
-      } catch (error) { message(error.message || '彻底删除项目失败', true); actions.querySelectorAll('button').forEach(button => { button.disabled = false; }); }
+        view.remove(project.chatIds);
+      } catch (error) { if (view.current()) message(error.message || '彻底删除项目失败', true); actions.querySelectorAll('button').forEach(button => { button.disabled = false; }); }
     }));
     item.append(main, actions); target.appendChild(item);
   }
@@ -296,6 +310,16 @@
     const epoch = ++renderEpoch, scope = stateKey;
     const sessionApi = api();
     const current = () => { projectStore(); return epoch === renderEpoch && scope === stateKey; };
+    const removed = new Set();
+    activeRead = { current, remove(ids) {
+      if (!current()) return;
+      for (const id of ids.filter(Boolean)) removed.add(String(id));
+      archiveChats = archiveChats.filter(row => !removed.has(row.id));
+      archiveProjects = (projectStore()?.get().archivedProjects || []).slice();
+      // A confirmed receipt already identifies the removed records. Keep the
+      // loaded inventory and unaffected DOM instead of reading every page again.
+      renderFiltered({ preserveChats: true });
+    } };
     let localRows = [], remoteRows = [], catalog = null;
     function paint() {
       if (!current()) return;
@@ -303,6 +327,7 @@
       const rows = new Map();
       for (const row of [...remoteRows, ...localRows]) {
         const canonical = global.WorkspaceSidebarState?.localHistoryId?.(row.id) || row.id;
+        if (removed.has(row.id) || removed.has(canonical)) continue;
         const record = records.get(canonical);
         if (record && (record.deleted || !record.archived)) continue;
         rows.set(record?.id || row.id, { ...row, id: record?.id || row.id });
@@ -403,6 +428,7 @@
     projectStore();
     if (stateKey === before) return;
     renderEpoch++;
+    activeRead = null;
     archiveChats = []; archiveProjects = [];
     if (document.getElementById('archivePanel')?.classList.contains('show')) {
       renderFiltered();

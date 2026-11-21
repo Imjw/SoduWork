@@ -67,6 +67,7 @@ function recoveredFiles(session) {
 
 async function snapshotAsync(session) {
   if (!session) return null;
+  if (session.historyArtifacts) return session.historyArtifacts.snapshotAsync();
   const cwd = session.cwd, sessionId = session.sessionId, owner = session.deliveryOwner, history = session.artifactHistory;
   const asynchronous = session.outputSnapshotAsync, synchronous = session.outputSnapshot, list = session.outputs;
   const recovered = recoveredFiles(session);
@@ -101,6 +102,7 @@ async function snapshotAsync(session) {
 
 function sessionSnapshot(session, scanned, recovered, candidates) {
   if (!session) return null;
+  if (session.historyArtifacts) return session.historyArtifacts.snapshot();
   const historical = require('./runtime-artifacts.cjs').restore(session.cwd, session.artifactHistory);
   const historicalPaths = new Set(historical.map(file => path.resolve(file.path)));
   const currentAnswer = selection.turn(session.artifactState || {}).answer;
@@ -199,6 +201,10 @@ function resolveSnapshot(session, artifactId, snapshot) {
     String(row && row.artifactId || '') === String(artifactId || ''));
   if (!item) return { ok: false, reason: '这份成果已经更新，请刷新后重试' };
   const candidatePath = path.resolve(String(item.path || ''));
+  if (session.historyArtifacts) {
+    if (!session.historyArtifacts.verify(candidatePath)) return { ok: false, reason: '成果文件已改变或无法读取' };
+    return { ok: true, item, path: candidatePath, stat: fs.statSync(candidatePath), snapshot, historyArtifacts: session.historyArtifacts };
+  }
   if (!outputs.inside(session.cwd, candidatePath)) {
     return { ok: false, reason: '这份成果不在当前会话工作区内' };
   }
@@ -294,21 +300,33 @@ function candidate(record, rawPath) {
     }
     if (!stat.isFile()) throw new Error('not a file');
     const real = fs.realpathSync(target);
-    if (!within(record.root, real, false)) return null;
+    if (!within(record.root, real, false) || record.historyArtifacts &&
+        (real !== target || !record.historyArtifacts.verify(target))) return null;
     return { path: real, stat };
   } catch (_) {
     /* Extensionless routes are application routes, not missing assets. */
     if (!path.posix.extname(clean)) {
       try {
         const real = fs.realpathSync(record.entry), stat = fs.statSync(real);
-        if (stat.isFile() && within(record.root, real, false)) return { path: real, stat, applicationRoute: true };
+        if (stat.isFile() && within(record.root, real, false) && (!record.historyArtifacts || record.historyArtifacts.verify(real))) return { path: real, stat, applicationRoute: true };
       } catch (_) { /* Entry was removed or replaced while previewing. */ }
     }
     return null;
   }
 }
 
-function serve(record, request, response) {
+function openVerified(found) {
+  const fd = fs.openSync(found.path, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    if (!found.historyArtifacts.verify(found.path, fs.fstatSync(fd, { bigint: true }))) throw Error('成果文件已改变或无法读取');
+    return fd;
+  } catch (error) { fs.closeSync(fd); throw error; }
+}
+
+async function serve(record, request, response) {
+  if (record.historyArtifacts) {
+    try { await record.historyArtifacts.authorize(); } catch (_) { sendError(response, 404, 'Not found'); return; }
+  }
   record.lastUsed = Date.now();
   const method = String(request.method || 'GET').toUpperCase();
   if (!['GET', 'HEAD'].includes(method)) {
@@ -346,9 +364,14 @@ function serve(record, request, response) {
     'Referrer-Policy': 'no-referrer', 'Cross-Origin-Opener-Policy': 'same-origin',
   };
   if (status === 206) headers['Content-Range'] = 'bytes ' + start + '-' + end + '/' + found.stat.size;
+  let fd;
+  if (record.historyArtifacts && method === 'GET') {
+    try { fd = openVerified({ ...found, historyArtifacts: record.historyArtifacts }); }
+    catch (_) { sendError(response, 404, 'Not found'); return; }
+  }
   response.writeHead(status, headers);
   if (method === 'HEAD') { response.end(); return; }
-  const stream = fs.createReadStream(found.path, found.stat.size ? { start, end } : undefined);
+  const stream = fs.createReadStream(found.path, { ...(found.stat.size ? { start, end } : {}), ...(fd === undefined ? {} : { fd }) });
   response.once('close', () => stream.destroy());
   stream.on('error', () => { if (!response.headersSent) sendError(response, 500, 'Read failed'); else response.destroy(); });
   stream.pipe(response);
@@ -378,7 +401,7 @@ async function startPreview(session, ref, artifactId, current) {
   const found = await resolveAsync(session, artifactId);
   if (!current()) return { ok: false, reason: '这条会话的预览已经关闭' };
   if (!found.ok) return found;
-  if (!['website', 'video'].includes(found.item.kind)) return { ok: false, reason: '这份成果不支持流式预览' };
+  if (!['website', 'video'].includes(found.item.kind) && !(found.historyArtifacts && found.item.kind === 'pdf')) return { ok: false, reason: '这份成果不支持流式预览' };
   return startResolvedPreview(found, ref, artifactId);
 }
 
@@ -386,7 +409,7 @@ async function startResolvedPreview(found, ref, artifactId) {
   const key = keyOf(ref, artifactId);
   const version = found.path + ':' + found.stat.mtimeMs + ':' + found.stat.size;
   const current = RECORDS.get(key);
-  if (current && current.version === version && current.server.listening) {
+  if (current && current.version === version && current.historyArtifacts === found.historyArtifacts && current.server.listening) {
     current.lastUsed = Date.now();
     return { ok: true, artifactId, status: 'running', url: current.url };
   }
@@ -395,7 +418,7 @@ async function startResolvedPreview(found, ref, artifactId) {
   const entry = fs.realpathSync(found.path);
   const record = {
     key, ref: String(ref || ''), artifactId: String(artifactId || ''),
-    itemAt: Number(found.item.at || 0), version, root, entry,
+    itemAt: Number(found.item.at || 0), version, root, entry, historyArtifacts: found.historyArtifacts,
     server: null, sockets: new Set(), url: '', lastUsed: Date.now(),
   };
   record.server = http.createServer((request, response) => serve(record, request, response));
@@ -461,6 +484,11 @@ async function previewInput(session, ref, rawTarget) {
 
 async function action(session, ref, artifactId, rawAction, deps) {
   const actionName = String(rawAction || '');
+  if (session?.historyArtifacts) {
+    await session.historyArtifacts.authorize();
+    if (!['preview', 'status', 'stop', 'read', 'image', 'image-full', 'open', 'location'].includes(actionName))
+      return { ok: false, reason: '历史成果仅支持查看已核验的文件' };
+  }
   if (actionName === 'preview') return preview(session, ref, artifactId);
   const key = keyOf(ref, artifactId);
   if (actionName === 'status') {
@@ -476,7 +504,7 @@ async function action(session, ref, artifactId, rawAction, deps) {
   const found = await resolveAsync(session, artifactId);
   if (!found.ok) return found;
   if (actionName === 'location') return { ok: true, path: found.path };
-  if (actionName === 'open' && found.item.kind === 'website') {
+  if (actionName === 'open' && (found.item.kind === 'website' || found.historyArtifacts && ['pdf', 'video'].includes(found.item.kind))) {
     return preview(session, ref, artifactId);
   }
   if (actionName === 'open') {
@@ -507,11 +535,13 @@ async function action(session, ref, artifactId, rawAction, deps) {
     return { ok: true, name: path.basename(found.path), size: data.length, at: Number(found.item.at || 0), data: data.toString('base64') };
   }
   if (actionName === 'read') {
-    const fd = fs.openSync(found.path, 'r');
+    const fd = found.historyArtifacts ? openVerified(found) : fs.openSync(found.path, 'r');
     let text;
     try {
       const buffer = Buffer.alloc(Math.min(found.stat.size, READ_CAP));
       text = buffer.subarray(0, fs.readSync(fd, buffer, 0, buffer.length, 0)).toString('utf8');
+      if (found.historyArtifacts && !found.historyArtifacts.verify(found.path, fs.fstatSync(fd, { bigint: true })))
+        throw Error('成果文件已改变或无法读取');
     } finally { fs.closeSync(fd); }
     return { ok: true, path: found.path, size: found.stat.size, tooBig: found.stat.size > READ_CAP,
       text };
@@ -521,7 +551,21 @@ async function action(session, ref, artifactId, rawAction, deps) {
     if (!/^image\/(?:png|jpeg|gif|webp|x-icon)$/.test(mimeType || ''))
       return { ok: false, reason: '这份成果不是支持内嵌预览的图片' };
     if (found.stat.size > 20 * 1024 * 1024) return { ok: false, reason: '图片超过 20 MB，请在原生应用中打开' };
-    const data = fs.readFileSync(found.path);
+    let data;
+    if (found.historyArtifacts) {
+      const fd = openVerified(found);
+      try {
+        data = Buffer.alloc(found.stat.size);
+        let size = 0;
+        while (size < data.length) {
+          const read = fs.readSync(fd, data, size, data.length - size, size);
+          if (!read) break;
+          size += read;
+        }
+        if (size !== data.length || !found.historyArtifacts.verify(found.path, fs.fstatSync(fd, { bigint: true })))
+          throw Error('成果文件已改变或无法读取');
+      } finally { fs.closeSync(fd); }
+    } else data = fs.readFileSync(found.path);
     if (data.length > 20 * 1024 * 1024) return { ok: false, reason: '图片超过 20 MB' };
     if (actionName === 'image' && deps.nativeImage) {
       const image = deps.nativeImage.createFromBuffer(data);

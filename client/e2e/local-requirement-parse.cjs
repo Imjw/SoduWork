@@ -39,11 +39,12 @@ fs.mkdirSync(profile);
 app.setAppPath(client); app.setPath('userData', profile); app.disableHardwareAcceleration();
 if (process.platform === 'darwin') app.commandLine.appendSwitch('use-mock-keychain');
 app.on('window-all-closed', () => {});
-const report = { ok: false, platform: process.platform, arch: process.arch, cases: [], boundary: 'Real Electron process, production preload, parser IPC, api.js, model resolver and safeStorage. macOS uses the Chromium test keychain. Authentication and non-streaming inference use synthetic TCP fixtures; the renderer is a minimal test page, not product-modal or production-model acceptance.' };
+const report = { ok: false, platform: process.platform, arch: process.arch, cases: [], boundary: 'Real Electron, production requirement form, preload, parser IPC, api.js, model resolver and safeStorage. macOS uses the Chromium test keychain. Authentication and inference use synthetic loopback services.' };
 const hubRequests = [], providerRequests = [], fixtureErrors = [];
 const privateKey = crypto.randomBytes(24).toString('hex');
 let win, hubServer, providerServer, hub, providerUrl, responseMode = 'success', account = '';
 let expectedLanguage = 'Simplified Chinese';
+const sheetInput = '帮我随便做个酷炫的网页';
 const js = async code => {
   try { return await win.webContents.executeJavaScript(code, true); }
   catch (error) { throw Error(error.message + '\nRenderer expression: ' + code); }
@@ -64,6 +65,14 @@ function session(device) {
 }
 async function parse(model, kind = 'requirement', input = 'Keep every original requirement.') {
   return js(`SoduWorkAPI.parseTaskText(${JSON.stringify(input)},${JSON.stringify(model)},[],{kind:${JSON.stringify(kind)}})`);
+}
+async function openRequirementForm(model) {
+  return js(`(async () => {
+    await ComposeDraft.open(${JSON.stringify(sheetInput)}, { variant: 'sheet', model: () => ${JSON.stringify(model)} });
+    const box = document.querySelector('#cpDraft');
+    return { title: box.querySelector('#cpTitle').value, note: box.querySelector('#cpNote').value,
+      warning: box.querySelector('.cp-parse-warning')?.textContent || '' };
+  })()`);
 }
 
 app.whenReady().then(async () => {
@@ -95,6 +104,14 @@ app.whenReady().then(async () => {
       // Reasoning may exhaust a small completion budget before any final text.
       if (outputBudget < 4096) return reply(response, { choices: [{ message: {
         content: '', reasoning_content: 'Private fixture reasoning' }, finish_reason: 'length' }] });
+      if (responseMode === 'sheet') {
+        assert.ok(body.messages[1].content.includes(sheetInput));
+        const answer = body.messages[0].content.includes(sheetInput)
+          ? '<!doctype html><title>Website</title>'
+          : '<think>Example {"title":"discard this"}</think>\n```json\n' +
+            JSON.stringify({ title: '页面需求', note: '整理页面效果与验收要求。', checklist: ['确认页面效果'] }) + '\n```';
+        return reply(response, { choices: [{ message: { content: answer }, finish_reason: 'stop' }] });
+      }
       const text = responseMode === 'invalid' ? '{"unexpected":"not a requirement"}' : responseMode === 'locale'
         ? JSON.stringify({ title: 'Review Project 星河', note: 'Prepare the release for Project 星河. Preserve "原文引用".',
           checklist: ['Confirm release readiness'], priority: 'normal', kind: 'requirement', due: '2026-12-01', tags: ['release'] }) : JSON.stringify({
@@ -141,10 +158,13 @@ app.whenReady().then(async () => {
   win.webContents.on('preload-error', (_event, _file, error) => console.error('[parser-preload]', error.message));
   const desk = pathToFileURL(path.join(client, 'desk.html')).href;
   const parserScripts = [...JSON.parse(fs.readFileSync(path.join(client, 'core/locales/manifest.json'), 'utf8'))
-    .map(file => 'core/locales/' + file), 'core/i18n.js', 'core/api-work-plugins.js', 'api.js'];
+    .map(file => 'core/locales/' + file), 'core/i18n.js', 'core/api-work-plugins.js', 'api.js',
+    'core/requirements.js', 'components/panels/task-priority.js', 'components/panels/requirement-routing.js',
+    'components/requirements/requirement-fields.js', 'components/panels/panels-compose-submit.js',
+    'components/panels/compose-selection-position.js', 'components/panels/panels-compose-draft.js'];
   win.webContents.session.protocol.handle('file', request => request.url === desk
     ? new Response('<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src \'self\'; connect-src \'none\'; object-src \'none\'"><title>Private requirement parser</title>' +
-      parserScripts.map(file => '<script src="' + file + '"></script>').join(''),
+      '<div id="cpDraft"></div>' + parserScripts.map(file => '<script src="' + file + '"></script>').join(''),
       { headers: { 'Content-Type': 'text/html; charset=utf-8' } })
     : net.fetch(request.url, { bypassCustomProtocolHandlers: true }));
   await win.loadURL(desk);
@@ -195,10 +215,19 @@ app.whenReady().then(async () => {
   mark('English UI locale reaches the real provider request and renderer retains English draft fields, proper names and quotations');
   await js("SoduWorkI18n.setLocale('zh-CN', {persist:false,broadcast:false})");
   expectedLanguage = 'Simplified Chinese';
+  responseMode = 'sheet';
+  const beforeSheet = providerRequests.length;
+  assert.deepEqual(await openRequirementForm(keyedRef), { title: '页面需求', note: '整理页面效果与验收要求。', warning: '' });
+  assert.equal(providerRequests.length, beforeSheet + 1);
+  mark('The requirement form consumes the final JSON from a reasoning model in a single call');
   responseMode = 'truncated';
   assert.match((await parse(localRef))._parseError, /长度上限.*原文已保留/);
   responseMode = 'invalid';
   assert.match((await parse(localRef))._parseError, /格式无效.*原文已保留/);
+  const invalidForm = await openRequirementForm(keyedRef);
+  assert.equal(invalidForm.title, sheetInput);
+  assert.equal(invalidForm.note, sheetInput);
+  assert.match(invalidForm.warning, /格式无效.*原文已保留/);
   responseMode = 'error';
   const failed = await parse(localRef);
   assert.match(failed._parseError, /本地模型服务返回错误.*原文已保留/);

@@ -38,7 +38,16 @@ function descriptor(raw, history = raw.historyRow?.()) {
 function resumeOptions(options) {
   const row = segments.read(options.app, options.runtimeConversationId);
   if (!row) return { options, row: null };
-  segments.assertOwner(options.app, row, options.identity);
+  if (options.deviceContinuationGrant) {
+    const granted = require('../conversation/device-local-continuation.cjs').assert(
+      options.deviceContinuationGrant, options.app, options.identity, row.id);
+    if (!row.deviceShared || row.executionOwner !== granted.executionOwner)
+      throw Error('执行账号已变化，请从本机历史新建执行段');
+  } else {
+    segments.assertOwner(options.app, row, options.identity);
+    if (row.deviceShared && row.executionOwner !== segments.scope(options.identity))
+      throw Error('执行账号已变化，请在本机桌面重新打开会话');
+  }
   const runner = row.active.adapterId !== 'pi';
   const canResume = runner ? row.active.path : row.active.path && fs.existsSync(row.active.path);
   return { row, options: { ...options, adapterId: row.active.adapterId, cwd: row.cwd,
@@ -54,7 +63,10 @@ function resumeOptions(options) {
     modelName: row.active.modelName,
     reasoningEffort: row.active.reasoningEffort ?? options.reasoningEffort,
     accessPolicy: row.accessPolicy, readOnly: row.readOnly, activePluginIds: row.activePluginIds,
-    contextPrompts: [...(options.contextPrompts || []), segments.brief(row.prefix)] } };
+    contextPrompts: [...(options.contextPrompts || []), row.deviceHistoryComplete
+      ? require('../conversation/device-history-handover.cjs').brief(row.prefix, { row: row.deviceHistoryContext || row,
+        cwd: row.cwd, attachments: row.deviceHistoryContext?.attachments || row.historyRecovery?.attachments || [] })
+      : segments.brief(row.prefix)] } };
 }
 function create({ raw: initial, options, restored, openNative, disposeNative, probe, catalog, changed }) {
   let raw = initial, record = restored, switching = false, closed = false, unsub = null, switchingCompletion = null, pendingModel = null;
@@ -73,6 +85,8 @@ function create({ raw: initial, options, restored, openNative, disposeNative, pr
   const environment = { hub: options.identity?.hub, clientId: options.identity?.clientId };
   function switchIdentity(selection) {
     const current = selection.identity || options.identity;
+    if (options.deviceContinuationGrant) require('../conversation/device-local-continuation.cjs').assert(
+      options.deviceContinuationGrant, options.app, current, publicId);
     if (!owner || segments.scope(current) !== owner || current.hub !== environment.hub || current.clientId !== environment.clientId)
       throw Error('账号或服务已变化，请重新打开这条会话');
     return current;
@@ -80,7 +94,7 @@ function create({ raw: initial, options, restored, openNative, disposeNative, pr
   function snapshot(value) {
     const s = nativeSource.snapshot(value || raw.snapshot(), raw.adapterId);
     if (!record) return { ...s, runtimeSwitching: switching };
-    return { ...s, runtimeSwitching: switching,
+    return { ...s, runtimeSwitching: switching, ...(record.historyRecovery ? { historyRecovery: record.historyRecovery } : {}),
       usageReceipts: [...(prefix.usageReceipts || []), ...(s.usageReceipts || [])],
       turnMetrics: [...(prefix.turnMetrics || []), ...(s.turnMetrics || []).map(metric => ({ ...metric,
         fromMessage: metric.fromMessage + prefix.messages.length, toMessage: metric.toMessage + prefix.messages.length }))],
@@ -188,13 +202,16 @@ function create({ raw: initial, options, restored, openNative, disposeNative, pr
       for (const tool of historical.tools.slice(prefix.tools.length)) tool.id = ids.get(tool.id);
       for (const message of historical.messages.slice(prefix.messages.length)) for (const block of message.blocks || [])
         if (block.toolCall?.id && ids.has(block.toolCall.id)) block.toolCall.id = ids.get(block.toolCall.id);
-      const nextRecord = { version: 1, id: publicId, owner,
+      const nextRecord = { version: 1, id: publicId, owner: record?.deviceShared ? record.owner : owner,
+        ...(record?.deviceShared ? { deviceShared: true, executionOwner: owner } : {}),
+        ...(record?.deviceHistoryComplete ? { deviceHistoryComplete: true, deviceTransferId: record.deviceTransferId || '',
+          deviceHistoryContext: record.deviceHistoryContext, historyRecovery: record.historyRecovery } : {}),
         title: segments.title(record) || old.historyRow?.()?.title || '', cwd: old.cwd, originAdapter,
         at: Date.now(), prefix: historical, artifactHistory,
         accessPolicy: policy, readOnly: options.readOnly,
         activePluginIds: before.activePlugins || [],
         segments: [...(record?.segments || []), oldDescriptor],
-        active: { ...descriptor(next), modelName,
+        active: { ...descriptor(next), modelName, ...(record?.deviceShared ? { executionOwner: owner } : {}),
           ...(agentId === 'codex' ? { reasoningEffort: next.snapshot()?.thinking?.level || '' } : {}),
           started: false, usedHarnesses: [] } };
       if (closed) throw Error('会话已关闭，本次切换已取消');
@@ -244,6 +261,7 @@ function create({ raw: initial, options, restored, openNative, disposeNative, pr
     historyRow(s) {
       const current = raw.historyRow?.(s);
       return { ...current, id: publicId, ref: publicRef,
+        ...(record?.deviceShared ? { workOwner: record.owner } : {}),
         usedHarnesses: harnesses.merge(harnesses.fromRecord(record),
           current?.usedHarnesses || harnesses.fromSnapshot(raw.snapshot(), raw.adapterId)),
         ...(record ? { title: segments.title(record) || current?.title || '' } : {}),
@@ -267,6 +285,11 @@ function create({ raw: initial, options, restored, openNative, disposeNative, pr
       const value = raw[key];
       if (typeof value !== 'function') return value;
       if (methods.get(key)?.source !== value) methods.set(key, { source: value, call: (...args) => {
+        if (options.deviceContinuationGrant && ['submit', 'send', 'bindTask'].includes(key)) {
+          const continuation = require('../conversation/device-local-continuation.cjs');
+          continuation.assert(options.deviceContinuationGrant, options.app, options.identity, publicId);
+          continuation.assertSelections(key === 'bindTask' ? { taskId: args[0] } : args[2]);
+        }
         if ((closed || switching) && ['send', 'submit', 'selectModel', 'setThinkingLevel', 'setAccessPolicy', 'bindTask'].includes(key)) {
           const result = { ok: false, reason: closed ? '会话已关闭，请重新打开' : '正在切换 Agent，请稍候再发送' };
           return key === 'submit' ? { accepted: false, result } : result;

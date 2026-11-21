@@ -117,3 +117,5 @@
   .cp-effort-card *{transition:none!important;animation:none!important}
   .cp-effort-sparks{display:none}
 }
+.cp-switch-model label{display:grid;gap:6px;color:var(--ink-2)}
+.cp-switch-model select{width:100%;min-width:0;padding:8px;color:var(--ink);background:var(--bg-1);border:1px solid var(--line);border-radius:6px;font:inherit}

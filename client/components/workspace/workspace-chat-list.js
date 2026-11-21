@@ -366,11 +366,10 @@ async function deleteHistoryChat(id) {
       // or the next "open conversation" would try to resume a missing archive.
       for (const id of applied.ids) ChatCollaborationStore.remove(id);
     }
-    if (activeLifecycleTarget(applied, selection)) {
-      ctx.activeChatId = '';
-      await openNewConversation();
-    }
+    const replaceActive = activeLifecycleTarget(applied, selection);
+    if (replaceActive) ctx.activeChatId = '';
     renderChats();
+    if (replaceActive) await openNewConversation();
     return true;
   }
 
@@ -393,11 +392,10 @@ async function archiveHistoryChat(id) {
     const applied = applyLifecycle({ ...got, archived: true }, key, startedAt);
     if (!applied) return true;
     if (!forgetPinned(applied.ids, '这条会话暂时无法归档', true)) return false;
-    if (activeLifecycleTarget(applied, selection)) {
-      ctx.activeChatId = '';
-      await openNewConversation();
-    }
+    const replaceActive = activeLifecycleTarget(applied, selection);
+    if (replaceActive) ctx.activeChatId = '';
     renderChats();
+    if (replaceActive) await openNewConversation();
     return true;
   }
 
@@ -770,7 +768,11 @@ function _paintChatLocale(button) {
     const copy = button._localeChat;
     if (!copy) return;
     const label = copy.title || ctx.wsT('chat.untitled', '未命名对话');
-    const status = copy.offlineCloudCache ? historyText('workspace.history.cloudCache', '本地缓存（只读）')
+    const missing = copy.historyContentState === 'missing';
+    button.dataset.historyContent = missing ? 'missing' : '';
+    button.dataset.historyLabel = missing ? historyText('workspace.history.bodyMissing', '正文缺失') : '';
+    const status = missing ? historyText('workspace.history.metadataOnly', '仅剩标题，正文缺失')
+      : copy.offlineCloudCache ? historyText('workspace.history.cloudCache', '本地缓存（只读）')
       : ctx.wsT('chat.state.' + copy.state, ctx.CHAT_STATE[copy.state]);
     // The title is user data. Translate only the surrounding status, and keep
     // the generic DOM adapter from interpreting the combined attribute text.
@@ -809,7 +811,7 @@ function _paintChatRow(row, c, isPinned) {
     const { ids: harnesses, draft } = displayedHarnesses(c);
     const runtimeName = harnesses.map(id => harnessNames()[id]).join('、');
     b._localeChat = { title: c.title, state, harnesses: runtimeName,
-      draftHarness: draft, offlineCloudCache: c.offlineCloudCache };
+      draftHarness: draft, offlineCloudCache: c.offlineCloudCache, historyContentState: c.historyContentState };
     _paintChatLocale(b);
     dot.className = 'st-chat st-chat-' + state;
     /* A local collaboration cache is presentation state, not proof that this

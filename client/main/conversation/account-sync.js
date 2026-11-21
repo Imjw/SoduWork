@@ -127,9 +127,37 @@ function linkCloudHistory(rows) {
   });
 }
 
-function create({ app, identityOf, localIdentityOf, store, resolveNativeSource, resolveDisplayLinks, retryMs = 5000,
+function disabledSync(store) {
+  let closing;
+  const lifecycle = async id => {
+    if (typeof id !== 'string' || !id.trim() || id.length > 512)
+      return { ok: false, disabled: true, reason: '会话标识无效' };
+    if (id.startsWith('acct-'))
+      return { ok: false, disabled: true, reason: '跨设备本地会话同步已停用，请在来源设备管理会话' };
+    // Native ownership and archive checks remain with the local lifecycle
+    // caller. Disabling directory sync must not block offline local actions.
+    return { ok: true, disabled: true, found: false, localOnly: true, aliasIds: [id], nativeIds: [] };
+  };
+  return {
+    bind: () => null,
+    flush: async () => ({ ok: true, disabled: true }),
+    history: async () => ({ ok: true, disabled: true, chats: [], lifecycle: [] }),
+    row: async () => null, openProjection: async () => null,
+    sourceProjection: () => null, isRemote: () => false, isAccountConversation: () => false,
+    onChange: () => () => {}, jobs: () => [], resolveLifecycle: lifecycle,
+    setLifecycle: async (id, action) => ['archive', 'restore', 'delete'].includes(action)
+      ? lifecycle(id) : { ok: false, disabled: true, reason: '会话操作无效' },
+    // Keep legacy checkpoints, queued content and directory caches intact.
+    // Closing an already-created store releases its worker without flushing.
+    close: () => closing ||= Promise.resolve().then(() => store?.close?.()),
+  };
+}
+
+function create({ app, identityOf, localIdentityOf, store, enabled = true, resolveNativeSource, resolveDisplayLinks, retryMs = 5000,
   fetch = fetchWithDeviceAuthRetry, now = () => Date.now(), realtime = false,
   discovery = require('../native-discovery.cjs'), refreshOptions = {}, metadataOnly = false, preserveLegacyOutbox }) {
+  // Stop before reading even a persisted outbox: startup replay is also sync.
+  if (enabled === false) return disabledSync(store);
   const bound = new Map();
   let closed = false;
   let timer = null;

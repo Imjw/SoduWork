@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { createInterface } = require('node:readline');
 const harnesses = require('../conversation/used-harnesses');
+const unrelatedArchive = Symbol('unrelated archive');
 
 function inside(root, target) {
   const relative = path.relative(root, target);
@@ -26,12 +27,12 @@ async function mapLimit(items, visit) {
   return results;
 }
 
-async function readSummary(file, stat, project) {
+async function readSummary(file, stat, project, wanted = '') {
   let header, firstMessage = '', name, count = 0, activity, workOwner, initialized = false, movedCwd = '';
   const bindings = [];
   const turn = require('./history-state').archiveTurn();
   const usedHarnesses = new Set();
-  const input = fs.createReadStream(file, { encoding: 'utf8' });
+  const input = fs.createReadStream(file, { encoding: 'utf8', ...(wanted ? { highWaterMark: 8192 } : {}) });
   const lines = createInterface({ input, crlfDelay: Infinity });
   try {
     for await (const line of lines) {
@@ -40,6 +41,7 @@ async function readSummary(file, stat, project) {
       if (!entry || typeof entry !== 'object') continue;
       if (!header) {
         if (entry.type !== 'session' || typeof entry.id !== 'string' || !entry.id) return null;
+        if (wanted && entry.id !== wanted) return unrelatedArchive;
         header = entry;
         continue;
       }
@@ -111,10 +113,10 @@ function createArchiveHistory({ root, project, read = readSummary }) {
       throw Object.assign(Error('会话存档已损坏或标识不一致，请检查本地存储后重试'), { code: 'HISTORY_ARCHIVE_INVALID' });
     return row;
   }
-  async function load(file, base, strictId = '') {
+  async function load(file, base, strictId = '', wanted = '') {
     if (pending.has(file)) {
       try { await pending.get(file); } catch (error) { if (strictId) throw error; }
-      return load(file, base, strictId);
+      return load(file, base, strictId, wanted);
     }
     const work = (async () => {
       try {
@@ -125,7 +127,9 @@ function createArchiveHistory({ root, project, read = readSummary }) {
         const cached = files.get(file);
         if (cached && cached.target === safe.target && cached.version === version)
           return requireTarget(cached.row, candidate, strictId);
-        const row = await read(safe.target, safe.stat, project);
+        const row = await read(safe.target, safe.stat, project, candidate ? '' : wanted);
+        // A header proves a different identity but cannot populate the listing cache.
+        if (row === unrelatedArchive) { forget(file); return null; }
         requireTarget(row, candidate, strictId);
         // A live append during parsing must not mark a partial projection as current.
         const after = await safeFile(file, base);
@@ -147,8 +151,8 @@ function createArchiveHistory({ root, project, read = readSummary }) {
     try { return await work; } finally { pending.delete(file); }
   }
 
-  async function refresh(strictId = '') {
-    if (!strictId && refreshing) return refreshing;
+  async function refresh(strictId = '', wanted = '') {
+    if (!wanted && refreshing) return refreshing;
     const work = (async () => {
       let base, folders;
       try {
@@ -175,10 +179,10 @@ function createArchiveHistory({ root, project, read = readSummary }) {
       });
       const paths = groups.flat(), seen = new Set(paths);
       for (const file of files.keys()) if (!seen.has(file)) forget(file);
-      const rows = await mapLimit(paths, file => load(file, base, strictId));
+      const rows = await mapLimit(paths, file => load(file, base, strictId, wanted));
       return rows.filter(Boolean).sort((a, b) => Number(b.at) - Number(a.at));
     })();
-    if (!strictId) refreshing = work;
+    if (!wanted) refreshing = work;
     try { return await work; } finally { if (refreshing === work) refreshing = null; }
   }
 
@@ -246,7 +250,7 @@ function createArchiveHistory({ root, project, read = readSummary }) {
           if (!(strict ? ['ENOENT'] : ['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM']).includes(error.code)) throw error;
         }
       }
-      if (attempt) refreshed = await refresh(strictId);
+      if (attempt) refreshed = await refresh(strictId, wanted);
       if (!file) {
         const direct = Array.isArray(refreshed)
           ? refreshed.find((row) => row && row.id === wanted)

@@ -27,9 +27,12 @@ async function fixture(t) {
   const shared = require('../main/conversation/shared-history.cjs').create({ app, session: bridge, identityOf: () => current });
   bridge.setReplicaHistory(shared);
   t.after(async () => { await shared.close(); await bridge.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
-  await shared.capture({ historyRow: () => original, snapshot: () => ({ messages: [
+  const [imported] = await shared.register([{ id: 'explicitly-imported-transcript', title: original.title,
+    cached: true, importedHistory: true, source: { id: original.id, account: 'one', hub: actor.hub },
+    sourceSessionId: original.sourceSessionId }]);
+  await shared.store.cache(imported.id, [
     { role: 'user', text: 'Synthetic historical question' }, { role: 'assistant', text: 'Synthetic historical answer' },
-  ] }) }, actor);
+  ], { expectedRevision: imported.replicaRevision, complete: true });
   const copy = (await shared.list()).items.find(row => row.cached);
   await shared.register([{ ...copy, historyAliasIds: ['copy-native-alias'] }]);
   const cards = cardsModule.create({ app, session: bridge, sharedHistory: shared,
@@ -61,7 +64,7 @@ test('independent cached transcript restores without joining its remote source o
   assert.equal(fs.existsSync(cardsModule.location(f.app, selected.id)), false);
 });
 
-test('cached cloud preflight is passive for its owner and denied across accounts or sign-out', async t => {
+test('imported remote transcript preflight is passive for its owner and denied across accounts or sign-out', async t => {
   const f = await fixture(t);
   const card = { id: 'draft', actionId: 'work.requirement.create', prompt: 'Private synthetic draft', seed: {}, state: {}, files: [], closed: false };
   for (const actor of [f.actor, identity('two'), { ...f.actor, hub: 'https://other.invalid' }, null]) {
@@ -88,6 +91,23 @@ test('cached cloud preflight is passive for its owner and denied across accounts
   await f.shared.lifecycle(f.copy.id, 'delete', f.actor);
   assert.equal((await f.cards.read(f.copy.id)).ok, false, 'deleted local transcripts are not resurrected');
   assert.equal(fs.existsSync(cardsModule.location(f.app, f.copy.id)), false);
+});
+
+test('work card preflight cannot disclose a retired automatic account cache through direct store lookup', async t => {
+  const f = await fixture(t);
+  const source = { id: f.original.id, hub: f.actor.hub, account: 'one' };
+  const id = require('../main/conversation/history-cache-policy.cjs').capturedCopyId(source.hub, source.account, source.id);
+  await f.shared.register([{ id, cached: true, adapterId: 'account-sync', locationMode: 'account',
+    source, sourceSessionId: f.native.id, title: 'Retired private title', historyAliasIds: ['retired-cache-alias'] }]);
+  for (const requested of [id, 'retired-cache-alias']) {
+    const result = await f.cards.read(requested);
+    assert.equal(result.ok, false);
+    assert.equal(result.presence, undefined);
+    assert.equal(result.cards, undefined);
+  }
+  assert.equal((await f.shared.store.get(id)).title, 'Retired private title');
+  assert.equal(fs.existsSync(cardsModule.location(f.app, id)), false);
+  assert.equal((await f.cards.read(f.native.id)).ok, true, 'A retired source locator cannot hide an owned native archive');
 });
 
 test('native form restore and its ownership checks are unchanged by cached transcript preflight', async t => {

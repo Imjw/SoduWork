@@ -346,6 +346,8 @@ function getPiSessionDetails(runtimeSession) {
   return PI_SESSION_DETAILS.get(runtimeSession) || null;
 }
 
+const openFailureCodes = new Set(['TASK_BINDING_MISMATCH', 'LOCAL_HISTORY_MODEL_UNAVAILABLE']);
+
 function createPiRuntimeAdapter(options) {
   const opts = options || {};
   const sessionModule = opts.sessionModule;
@@ -366,7 +368,7 @@ function createPiRuntimeAdapter(options) {
     async createSession(request) {
       const result = await sessionModule.open(toPiOpenOptions(request, opts));
       if (!result || !result.ok || !result.session) {
-        throw new RuntimeContractError(result?.code === 'TASK_BINDING_MISMATCH' ? result.code : 'PI_SESSION_OPEN_FAILED',
+        throw new RuntimeContractError(openFailureCodes.has(result?.code) ? result.code : 'PI_SESSION_OPEN_FAILED',
           String((result && result.reason) || 'Pi session failed to open'), { result });
       }
       return wrapPiSession(result.session, request, { result });
@@ -379,7 +381,7 @@ function createPiRuntimeAdapter(options) {
       }
       const result = await sessionModule.open(openOptions);
       if (!result || !result.ok || !result.session) {
-        throw new RuntimeContractError(result?.code === 'TASK_BINDING_MISMATCH' ? result.code : 'PI_SESSION_RESUME_FAILED',
+        throw new RuntimeContractError(openFailureCodes.has(result?.code) ? result.code : 'PI_SESSION_RESUME_FAILED',
           String((result && result.reason) || 'Pi session failed to resume'), { result });
       }
       return wrapPiSession(result.session, request, { result });

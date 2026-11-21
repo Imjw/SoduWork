@@ -51,6 +51,7 @@
   const probes = Object.create(null);
   const pendingProbes = new Map();
   let boundOptions = null;
+  let manualSelection = null;
   function syncOwner() {
     const owner = ownerScope();
     if (owner === activeOwner) return false;
@@ -520,27 +521,45 @@
       else if (global.WorkspaceHost && typeof global.WorkspaceHost.open === 'function') global.WorkspaceHost.open('agents');
     });
     button.addEventListener('click', () => { void loadCatalog(opts, true).then(() => refreshAccess()); });
-    popup.addEventListener('click', async (event) => {
+    popup.addEventListener('click', (event) => {
       const row = event.target.closest('[data-runtime]');
       if (!row || row.classList.contains('checking')) return;
       const adapterId = row.dataset.runtime || 'pi';
-      global.ComposeDirectoryPreferences?.selectionStarted?.();
+      const sameDraft = global.ComposeDirectoryPreferences?.selectionStarted?.();
       syncOwner();
       const selection = ++selectionGeneration;
+      const owner = ownerScope(), from = current, catalogVersion = catalogGeneration;
+      const valid = () => selection === selectionGeneration && owner === ownerScope() && from === current &&
+        catalogVersion === catalogGeneration && (typeof sameDraft !== 'function' || sameDraft());
       row.classList.add('checking');
       row.setAttribute('aria-busy', 'true');
       paint(root);
-      const available = await probe(adapterId, opts, true);
-      row.classList.remove('checking');
-      row.removeAttribute('aria-busy');
-      paint(root);
-      if (!available || selection !== selectionGeneration) return;
-      selectCurrent(adapterId);
-      global.ComposeDirectoryPreferences?.selectionCommitted?.();
-      changed();
-      opts.refresh();
-      paint(root);
-      opts.close();
+      const job = (async () => {
+        if (!await probe(adapterId, opts, true) || !valid()) return false;
+        const target = catalog.find(item => item.id === adapterId);
+        if (!target) return false;
+        const model = await global.ComposeModelPicker?.prepareRuntimeSwitch?.(target, valid, opts.say);
+        if (model === false || !valid() || catalog.find(item => item.id === adapterId)?.modelMode !== target.modelMode) return false;
+        if (!selectCurrent(adapterId)) return false;
+        model?.apply();
+        global.ComposeDirectoryPreferences?.selectionCommitted?.();
+        changed();
+        opts.refresh();
+        opts.close();
+        // A submit already waiting on the switch was written for the former
+        // model. A replacement needs its own subsequent Send action.
+        return model?.preservesModel !== false;
+      })().catch(() => {
+        if (valid()) opts.say(_rtText('模型目录暂时不可用'));
+        return false;
+      }).finally(() => {
+        row.classList.remove('checking');
+        row.removeAttribute('aria-busy');
+        if (manualSelection?.job === job) manualSelection = null;
+        paint(root);
+      });
+      manualSelection = { job, valid };
+      return job;
     });
     paint(root);
     accessProbePromise = loadCatalog(opts).then(() => probe(current, opts, false)).then(() => opts.refresh());
@@ -615,6 +634,7 @@
   global.ComposeRuntime = {
     bind, controls, paint, accessSupported, accessState, refreshAccess, goalSupported, ready, restoreSelection, resetNewDraft, value: () => current,
     brandIcon,
+    pendingSelection: () => manualSelection?.valid() ? manualSelection.job : null,
     location: () => location,
     availability: () => ({ checking: pendingProbes.has(probeKey(current)), ...(probes[probeKey(current)] || {}) }),
     setLocation(value) {

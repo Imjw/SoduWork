@@ -47,11 +47,9 @@ class AuthenticationTrafficTests(AuthenticationHttpFixture):
                 {"id": "traffic-assistant", "position": 1, "role": "assistant", "text": "Private Alice answer",
                  "createdAt": "2026-11-04T00:00:01Z", "done": True}]}
 
-    async def sync_conversation(self, node=0):
-        response = await self.http[node].post("/api/v1/account-conversations/sync",
-                                             headers=self.headers(), json=self.checkpoint())
-        self.assertEqual(response.status_code, 200, response.text[:300])
-        return response.json()
+    async def seed_conversation(self):
+        from tests.test_account_conversations import seed_legacy_checkpoint
+        return await seed_legacy_checkpoint(self.sessions, self.checkpoint(), owner="alice")
 
     async def seed_screens(self):
         expiry = datetime.now(timezone.utc) + timedelta(hours=1)
@@ -95,19 +93,24 @@ class AuthenticationTrafficTests(AuthenticationHttpFixture):
         self.assertNotIn("session", denied.json())
         self.assertEqual((await self.inbox(node=1)).status_code, 403)
 
-    async def test_account_sync_is_idempotent_and_transfer_blocks_old_token_and_cross_account_reads(self):
+    async def test_retired_sync_and_legacy_reads_keep_device_and_account_fences(self):
         await self.inbox()
-        await self.sync_conversation()
-        await self.sync_conversation(node=1)
-        listing = await self.http[1].get("/api/v1/account-conversations", headers=self.headers(1))
+        cid = await self.seed_conversation()
+        for node in (0, 1):
+            response = await self.http[node].post("/api/v1/account-conversations/sync",
+                headers=self.headers(), json=self.checkpoint())
+            self.assertEqual(response.status_code, 410, response.text)
+        listing = await self.http[1].get("/api/v1/account-conversations", headers=self.headers())
         self.assertEqual(listing.status_code, 200)
         self.assertEqual(len(listing.json()["items"]), 1)
-        row = listing.json()["items"][0]
-        self.assertEqual(row["messageCount"], 2)
-        cid = row["id"]
-        messages = await self.http[1].get(f"/api/v1/account-conversations/{cid}/messages", headers=self.headers(1))
+        self.assertEqual(listing.json()["items"][0]["messageCount"], 2)
+        messages = await self.http[1].get(f"/api/v1/account-conversations/{cid}/messages", headers=self.headers())
         self.assertEqual([x["text"] for x in messages.json()["items"]],
                          ["Private Alice question", "Private Alice answer"])
+        second = await self.http[1].get("/api/v1/account-conversations", headers=self.headers(1))
+        self.assertEqual(second.json()["items"], [])
+        self.assertEqual((await self.http[1].get(f"/api/v1/account-conversations/{cid}/messages",
+                                               headers=self.headers(1))).status_code, 404)
         async with self.sessions() as session:
             self.assertEqual(await session.scalar(select(func.count()).select_from(AccountConversation)), 1)
             self.assertEqual(await session.scalar(select(func.count()).select_from(AccountConversationMessage)), 2)
@@ -120,7 +123,7 @@ class AuthenticationTrafficTests(AuthenticationHttpFixture):
         bob_list = await self.http[1].get("/api/v1/account-conversations", headers=self.bob_headers)
         self.assertEqual(bob_list.json()["items"], [])
         self.assertEqual((await self.http[1].get(f"/api/v1/account-conversations/{cid}/messages",
-                                               headers=self.headers(1))).status_code, 200)
+                                               headers=self.headers(1))).status_code, 404)
 
     async def test_usage_replay_is_idempotent_and_quota_exhaustion_is_immediate(self):
         async with self.sessions() as session:
@@ -255,7 +258,7 @@ class AuthenticationTrafficTests(AuthenticationHttpFixture):
     async def test_scaled_internal_traffic_mix_with_business_rows_and_real_authentication(self):
         await self.seed_screens()
         await self.seed_messages()
-        await self.sync_conversation()
+        await self.seed_conversation()
         await self.inbox()
         weights = {"inbox": 69725, "screen": 11184, "relay": 6264, "enroll": 4002,
                    "team": 3302, "accountsync": 1889, "usage": 703, "my_models": 645}
@@ -281,7 +284,8 @@ class AuthenticationTrafficTests(AuthenticationHttpFixture):
                 options = {"headers": self.headers(), **extra}
                 start = len(self.sql)
                 response = await self.http[performed % 2].request(method, path, **options)
-                self.assertEqual(response.status_code, 200, (name, response.text[:300]))
+                self.assertEqual(response.status_code, 410 if name == "accountsync" else 200,
+                             (name, response.text[:300]))
                 reads = [sql for sql in self.sql[start:] if sql.lstrip().startswith("select")]
                 sql_profile[name]["selects"] += len(reads)
                 sql_profile[name]["fullClientReads"] += sum("client.model_keys" in sql for sql in reads)

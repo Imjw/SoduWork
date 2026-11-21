@@ -158,14 +158,14 @@ async function open(opts) {
     return { ok: false, reason: '直接生图请使用普通对话；目标和需求可通过图片插件生成图片' };
   }
   let resetSavedModel = false;
-  const allowHistoricalModel = Boolean(opts.resumePath || opts.resumedConversation);
+  const allowHistoricalModel = !opts.startDeviceSegment && Boolean(opts.resumePath || opts.resumedConversation);
   let prep = await modelConfig.prepare(app, identity, modelName, { allowHistorical: allowHistoricalModel });
   _openTiming('model-prepared', openStarted);
   // A conversation can outlive a personal model.  Its historical selection
   // must not make the whole conversation unopenable after that model is
   // removed from the personal model catalog; retry once with the current default and clear
   // the stale selection for future resumes.
-  const canRecoverStaleModel = Boolean(opts.resumePath || opts.resumedConversation) &&
+  const canRecoverStaleModel = allowHistoricalModel &&
     prep?.code !== 'LOCAL_AGENT_DEFAULT_UNAVAILABLE';
   // Some older Hub releases returned a successful default configuration even
   // when the requested historical model had already been retired. Treat a
@@ -174,6 +174,9 @@ async function open(opts) {
   // "model unavailable" error.
   const returnedModel = String(prep?.model?.id || '').trim();
   const returnedDifferentModel = Boolean(prep.ok && !prep.model?.localOnly && modelName && returnedModel && returnedModel !== modelName);
+  if (opts.startDeviceSegment && returnedDifferentModel && !require('./image-model').imageChoice(modelName)) {
+    return { ok: false, reason: '当前账号无法使用所选模型，请重新选择模型后发送' };
+  }
   // A historical archive may predate the durable model-selection entry. In
   // that case `modelName` is empty, but the Hub can still reject its own stale
   // Agent preference. Only a resumed conversation may bypass that preference;

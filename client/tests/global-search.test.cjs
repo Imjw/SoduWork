@@ -197,6 +197,37 @@ test('native search reads an actual JSONL archive through the existing safe read
   assert.equal(blocked.chats.length, 0); assert.equal(blocked.partial, true);
 });
 
+test('desktop search finds an ordinary local transcript after an account switch and excludes private titles', async t => {
+  const root = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'soduwork-search-two-accounts-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const app = { getPath: () => root };
+  const { identity } = require('./helpers/platform-session-fixture.cjs');
+  const current = identity('two'), creator = { account: 'one', hub: current.hub };
+  t.mock.method(require('../main/conversation/requirement-context'), 'cachedIdentity', () => current);
+  t.mock.method(require('../main/app-menu-info.cjs'), 'createTrustedWindow', () => () => true);
+  const bridge = require('../main/agent-runtime/pi-session-bridge');
+  const dir = path.join(root, 'pi-agent', 'sessions', 'project');
+  fs.mkdirSync(dir, { recursive: true });
+  const ordinary = { id: 'ordinary', path: path.join(dir, 'ordinary.jsonl'), adapterId: 'pi', title: 'Notes',
+    creator, localReplica: true, count: 1, at: 1 };
+  const privateRow = { ...ordinary, id: 'private', title: 'two-account fixture', taskId: 'private-task' };
+  fs.writeFileSync(ordinary.path, [JSON.stringify({ type: 'session', id: ordinary.id }),
+    JSON.stringify({ type: 'message', message: { role: 'user', content: 'two-account fixture' } })].join('\n') + '\n');
+  t.mock.method(bridge, 'history', async () => ({ ok: true, chats: [ordinary, privateRow] }));
+  t.mock.method(bridge, 'indexedHistoryRow', async id => id === ordinary.id ? ordinary : privateRow);
+  const handlers = {}, sender = { id: 17, once() {}, isDestroyed: () => false };
+  nativeSearch.install({ app, ipcMain: { handle: (name, fn) => { handlers[name] = fn; }, on() {} } });
+  const results = await handlers['conversation-search']({ sender }, 'two-account fixture');
+  assert.deepEqual(results.chats.map(hit => hit.id), [ordinary.id]);
+  assert.equal(results.chats[0].serverMatched, true);
+  const metadata = await handlers['conversation-search-history']({ sender });
+  assert.deepEqual(metadata.items.map(row => row.id), [ordinary.id]);
+  fs.appendFileSync(ordinary.path, JSON.stringify({ type: 'custom', customType: 'soduwork.task.binding',
+    data: { taskId: 'private-task', taskTitle: 'Private task' } }) + '\n');
+  assert.deepEqual((await handlers['conversation-search']({ sender }, 'two-account fixture')).chats, [],
+    'A newly protected transcript cannot be returned from the old excerpt cache');
+});
+
 test('archive path canonicalization preserves same-root reads and refuses junctions and outside files', async t => {
   const root = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'soduwork-search-path-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

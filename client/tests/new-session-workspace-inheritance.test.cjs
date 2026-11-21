@@ -189,7 +189,8 @@ test('archived conversations ignore removed workspace overrides and retain remot
   assert.doesNotMatch(ipc, /resumeWorkspace|resumeOverride|workspaceMoved/);
   assert.match(ipc, /require\('\.\/resume-cwd'\)\(app, resume, _defaultCwd\)/);
   assert.match(ipc, /if \(opts\.nativeRelay === true && resume\) \{\s*\n\s*require\('\.\/resume-cwd'\)\(app, resume, \(\) => \{/);
-  assert.match(ipc, /resumeCwd: resume \? cwd : '',/);
+  assert.match(ipc, /resumeCwd: resume && !startDeviceSegment \? cwd : '',/,
+    'Only an existing native session receives its archived working directory as a resume override');
   const sessionOpen = read('main/pi-session/session-open.js');
   assert.doesNotMatch(sessionOpen, /workspaceMoved|soduwork\.workspace\.moved/);
   assert.match(read('main/pi-session/archive-history.js'), /soduwork\.workspace\.moved/,

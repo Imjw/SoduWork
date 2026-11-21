@@ -4,6 +4,27 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const status = require('../components/panels/panels-chat-status.js');
 
+test('missing history content remains visible without implying active or successful execution', () => {
+  const current = { ref: 'metadata-only', snap: { status: 'idle', historyRecovery: {
+    bodyMissing: true, incomplete: true, reason: '仅剩会话标题，正文文件已丢失，无法恢复原会话内容' } } };
+  const view = status.createThinking(() => current);
+  assert.match(view.statusHtml(false), /nstatus show/);
+  assert.match(view.statusHtml(false), /正文文件已丢失/);
+  assert.doesNotMatch(view.statusHtml(false), /ndot|处理中/);
+  view.stopThinkingClock();
+});
+
+test('passive history reports the reason a new turn is blocked while eligible histories keep the normal composer status', () => {
+  const current = { ref: 'preview', snap: { status: 'idle', localReplica: true,
+    historyRecovery: { reason: 'A tool result has not been confirmed' }, execution: { readOnly: true, canContinueOnDevice: false } } };
+  const view = status.createThinking(() => current);
+  assert.match(view.statusHtml(false), /A tool result has not been confirmed/);
+  current.snap.historyRecovery = undefined;
+  assert.match(view.statusHtml(false), /当前仅可查看/);
+  current.snap.execution.canContinueOnDevice = true;
+  assert.doesNotMatch(view.statusHtml(false), /当前仅可查看|nstatus show/);
+});
+
 test('Runner queue waiting is visible without claiming model work or carrying wait into execution', () => {
   const originalNow = Date.now;
   let now = 1792810800000;

@@ -25,7 +25,7 @@ async def candidates(kind: str = Query(...), after: str = Query(default="", max_
                      limit: int = Query(default=50, ge=1, le=100),
                      client=Depends(current_client), session=Depends(get_session)):
     uid = owner(client)
-    model, query = inventory.query(kind, uid)
+    model, query = inventory.query(kind, uid, source_client_id=client.id)
     rows = list((await session.scalars(query.where(model.id > after).order_by(model.id).limit(limit + 1))).all())
     page = rows[:limit]
     return {"items": [{"id": value, "kind": kind} for value in page],
@@ -34,7 +34,7 @@ async def candidates(kind: str = Query(...), after: str = Query(default="", max_
 
 @router.get("/status")
 async def status(client=Depends(current_client), session=Depends(get_session)):
-    pending = await inventory.counts(session, owner(client))
+    pending = await inventory.counts(session, owner(client), source_client_id=client.id)
     return {"metadataOnly": conversation_content.metadata_only(), "pending": pending,
             "complete": not any(pending.values())}
 
@@ -52,9 +52,11 @@ async def migrate(kind: str, identity: str, body: dict = Body(default_factory=di
 async def _migrate(kind, identity, body, client, session, uid):
     if kind == "account":
         row = await session.get(AccountConversation, identity)
-        if not row or row.owner_user_id != uid:
+        if not row or row.owner_user_id != uid or row.source_client_id != client.id:
             raise HTTPException(404, "会话不存在")
-        return await migration.account(session, client, row, body.get("targetClientId") or row.source_client_id)
+        if body.get("targetClientId") and body["targetClientId"] != client.id:
+            raise HTTPException(410, "设备之间的会话迁移需要直连")
+        return await migration.account(session, client, row, row.source_client_id)
     if kind == "handoff":
         row = await session.get(ConversationHandoff, identity)
         if not row or row.owner_user_id != uid:
@@ -73,7 +75,7 @@ async def _migrate(kind, identity, body, client, session, uid):
         return await migration.execution(session, client, row)
     if kind == "relay":
         row = await session.get(PersonalConversationRelay, identity)
-        if not row or row.owner_user_id != uid:
+        if not row or row.owner_user_id != uid or row.source_client_id != client.id:
             raise HTTPException(404, "消息不存在")
         return await migration.relay(session, client, row)
     if kind == "schedule":

@@ -89,6 +89,7 @@
 
   function agentName(key) {
     const raw = String(key || 'unknown');
+    if (data?.agentNames && Object.hasOwn(data.agentNames, raw)) return data.agentNames[raw];
     return AGENT_NAMES[raw.toLowerCase()] || raw;
   }
 

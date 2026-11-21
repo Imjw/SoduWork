@@ -35,6 +35,11 @@ function _signedOut(app, id, value) {
   if (value) row.signedOut = true; else delete row.signedOut;
   _writeDoc(app, doc);
 }
+const _sessionIssued = new Set();
+function _notifySessionIssued(id) {
+  // Peer certificate issuance is optional and must not delay ordinary sign-in.
+  void Promise.allSettled([..._sessionIssued].map(listener => Promise.resolve().then(() => listener({ ...id }))));
+}
 const DEVICE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{2,63}$/;
 const TEXT = {
   badHub: '\u540e\u53f0\u5730\u5740\u5fc5\u987b\u662f\u4e0d\u5e26\u8def\u5f84\u7684 http:// \u6216 https:// \u5730\u5740',
@@ -539,6 +544,7 @@ async function _requestEnrollment(id, raw, app = null, generation = _generation(
         workRoot,
         user: safe.user, quota: safe.quota,
       });
+      if (cache) _notifySessionIssued({ ...id, session: safe.session });
     } else if (cache) {
       _sessions.delete(_sessionSlot(id.hub, id.clientId));
       if (safe.activationRequired) _block(id);
@@ -639,6 +645,7 @@ async function login(app, raw = {}, action = 'legacy') {
     });
     _signedOut(app, id, false);
     _anonymous.delete(generation.slot);
+    _notifySessionIssued({ ...id, session: safe.session });
     return safe;
   } catch (error) {
     if (!_current(generation)) return _changed(id);
@@ -860,5 +867,6 @@ function install({ app, ipcMain, safeStorage, credentials, onAuthUnavailable }) 
 }
 
 module.exports = { install, identity, session, localOwner, libraryWorkRoot, profiles, enroll, login, logout, clearSession, canConnect, requestAdmission,
+  onSessionIssued(listener) { _sessionIssued.add(listener); return () => _sessionIssued.delete(listener); },
   historyEpoch: id => JSON.stringify(id?.hub && id?.clientId ? _generation(id) : { selection: _selectionVersion }),
   ensureSession, authenticatedIdentity, selectHub, accountAction, refreshProfile };

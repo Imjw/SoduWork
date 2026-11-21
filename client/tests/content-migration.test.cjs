@@ -3,6 +3,28 @@ const test = require('node:test'), assert = require('node:assert/strict');
 const { create } = require('../main/conversation/content-migration.cjs');
 const { identity } = require('./helpers/platform-session-fixture.cjs');
 const reply = (value, status = 200) => ({ ok: status === 200, status, json: async () => value });
+test('cloud-only desktop upgrades leave legacy PC history untouched while migrating cloud content', async () => {
+  const calls = [], actor = identity();
+  const service = create({ includeAccountHistory: false, identityOf: async () => actor,
+    fetch: async (_, route, options) => {
+      const url = new URL(route); calls.push({ url, method: options.method });
+      if (url.pathname.endsWith('/status')) return reply({ metadataOnly: true,
+        complete: false, pending: { account: 2, handoff: 1 } });
+      if (options.method === 'GET') {
+        assert.equal(url.searchParams.get('kind'), 'handoff');
+        return reply({ items: [{ id: 'cloud-one' }], hasMore: false });
+      }
+      assert.ok(url.pathname.endsWith('/handoff/cloud-one'));
+      return reply({ ok: true });
+    } });
+  try {
+    await service.run();
+    assert.equal(calls.filter(call => call.method === 'POST').length, 1);
+    assert.equal(calls.some(call => call.url.searchParams.get('kind') === 'account'), false);
+    assert.equal(service.snapshot(actor).pending.account, 2);
+    assert.equal(service.snapshot(actor).phase, 'pending');
+  } finally { await service.close(); }
+});
 test('migration fences old writers first and never clears content on an old Hub', async () => {
   const calls = [], actor = identity();
   const service = create({ identityOf: async () => actor, fetch: async (_, route) => {

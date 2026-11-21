@@ -1,5 +1,7 @@
 'use strict';
 
+const { automaticAccountCache } = require('./history-cache-policy.cjs');
+
 // Device-local replica state is independent of cloud/account lifecycle state.
 // Production callers execute all SQLite and serialization work in a worker.
 const fs = require('node:fs');
@@ -9,6 +11,7 @@ const { DatabaseSync } = require('node:sqlite');
 
 const METHODS = ['register', 'join', 'importChunk', 'importPlan', 'importPage', 'sealImport', 'discardImport', 'get', 'sourceCopies', 'nativeRows', 'list', 'catalog', 'page', 'directory', 'lifecycleRows', 'remoteLifecycleRows', 'lifecycle', 'cache', 'messages', 'changes', 'ack', 'workspace', 'close'];
 const REMOTE_LIFECYCLE = "deleted=0 AND revision>0 AND json_extract(data,'$.cached')=1 AND coalesce(json_extract(data,'$.taskId'),'')<>''";
+METHODS.push('saveDeviceHistory', 'deviceHistory', 'deviceHistoryVersion');
 function key(value) {
   if (typeof value !== 'string' || !value.trim() || value.length > 512 || /[\x00-\x1f]/.test(value))
     throw Error('Invalid local conversation identity');
@@ -50,6 +53,8 @@ function create(file, { maxImportBytes = 512 * 1024 * 1024 } = {}) {
       CREATE INDEX IF NOT EXISTS aliases_replica ON aliases(replica);
       CREATE TABLE IF NOT EXISTS messages(replica TEXT NOT NULL REFERENCES replicas(id),position INTEGER NOT NULL,
         data TEXT NOT NULL,digest TEXT NOT NULL,PRIMARY KEY(replica,position));
+      CREATE TABLE IF NOT EXISTS device_history(replica TEXT PRIMARY KEY REFERENCES replicas(id),
+        data TEXT NOT NULL,digest TEXT NOT NULL,updated INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS import_chunks(replica TEXT NOT NULL,digest TEXT NOT NULL,offset INTEGER NOT NULL,
         body BLOB NOT NULL,PRIMARY KEY(replica,digest,offset));
       CREATE TABLE IF NOT EXISTS import_pages(replica TEXT NOT NULL,manifest TEXT NOT NULL,page INTEGER NOT NULL,
@@ -87,7 +92,7 @@ function create(file, { maxImportBytes = 512 * 1024 * 1024 } = {}) {
       .iterate(...rows.map(row => row.id))) aliases.get(row.replica).push(row.alias);
     return rows.map(row => project(row, aliases.get(row.id)));
   }
-  function register(rows, { expectedRevision } = {}) {
+  function register(rows, { expectedRevision, expectedAbsent = false, expectedHistoryDigest } = {}) {
     if (!Array.isArray(rows) || rows.length > 500) throw Error('Invalid local history batch');
     if (expectedRevision !== undefined && (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0))
       throw Error('Invalid local history revision');
@@ -97,6 +102,11 @@ function create(file, { maxImportBytes = 512 * 1024 * 1024 } = {}) {
       const matches = ids.map(exact).filter(Boolean), canonical = matches[0]?.id || id;
       if (matches.some(row => row.id !== canonical)) throw Error('Conflicting conversation aliases');
       const old = exact(canonical), previous = old ? JSON.parse(old.data) : {};
+      // A transfer may spend time verifying files after inspecting the target.
+      // Assert the predecessor inside the same transaction as the index write.
+      if (expectedAbsent && old) throw Error('目标会话在接收期间已创建');
+      if (expectedHistoryDigest !== undefined && db.prepare('SELECT digest FROM device_history WHERE replica=?')
+        .get(canonical)?.digest !== expectedHistoryDigest) throw Error('目标会话正文在接收期间已变化');
       // A background repair cannot overwrite a more recent execution receipt.
       if (expectedRevision !== undefined && old?.catalog_revision !== expectedRevision) return project(old);
       if (old && id !== canonical) return project(old);
@@ -346,8 +356,12 @@ function create(file, { maxImportBytes = 512 * 1024 * 1024 } = {}) {
       if (ownership) for (const row of db.prepare('SELECT id,data,updated FROM replicas').iterate()) {
         const data = JSON.parse(row.data);
         byId.get(row.id).ownership = { id: row.id, localReplica: true, cached: data.cached,
+          automaticAccountCache: automaticAccountCache({ ...data, id: row.id }),
           creator: data.creator, source: data.source, sourceSessionId: data.sourceSessionId,
-          at: row.updated, workOwner: data.workOwner,
+          sourceClientId: data.sourceClientId, sourceLocalId: data.sourceLocalId,
+          at: row.updated, workOwner: data.workOwner, adapterId: data.adapterId,
+          deviceTransferId: data.deviceTransferId, importedHistory: data.importedHistory,
+          importDigest: data.importDigest, location: data.location, locationMode: data.locationMode,
           // Main-process filtering needs the protection bit, not private task
           // contexts or payloads. It is removed before publishing the catalog.
           historyProtection: data.historyProtection === 'account' || data.cloud || data.remoteProjection ||
@@ -414,11 +428,18 @@ function create(file, { maxImportBytes = 512 * 1024 * 1024 } = {}) {
         const receipt = db.prepare('INSERT INTO operations(replica,action,actor,created) VALUES(?,?,?,?)').run(row.id, action, audit, Date.now());
         db.prepare('UPDATE replicas SET archived=?,deleted=?,revision=?,catalog_revision=? WHERE id=?')
           .run(action === 'archive' ? 1 : 0, action === 'delete' ? 1 : 0, Number(receipt.lastInsertRowid), Number(receipt.lastInsertRowid), row.id);
-        if (action === 'delete') db.prepare('DELETE FROM messages WHERE replica=?').run(row.id);
+        if (action === 'delete') {
+          db.prepare('DELETE FROM messages WHERE replica=?').run(row.id);
+          db.prepare('DELETE FROM device_history WHERE replica=?').run(row.id);
+        }
         // Migrated copies of this same local source are recovery records, not
         // independent cloud originals. A late import must obey its tombstone.
         if (action === 'delete' && !preserveCopies) {
-          const copies = db.prepare("SELECT id FROM replicas WHERE deleted=0 AND json_extract(data,'$.sourceLocalId') IN (SELECT alias FROM aliases WHERE replica=?)").all(row.id);
+          // Bind each alias directly so SQLite seeks the expression index;
+          // an IN subquery can choose a scan of every active conversation.
+          const lookup = db.prepare("SELECT id FROM replicas WHERE deleted=0 AND json_extract(data,'$.sourceLocalId')=?");
+          const copies = db.prepare('SELECT alias FROM aliases WHERE replica=?').all(row.id)
+            .flatMap(({ alias }) => lookup.all(alias));
           for (const copy of copies) {
             const revision = Number(db.prepare('INSERT INTO operations(replica,action,actor,created) VALUES(?,?,?,?)')
               .run(copy.id, action, audit, Date.now()).lastInsertRowid);
@@ -428,6 +449,38 @@ function create(file, { maxImportBytes = 512 * 1024 * 1024 } = {}) {
         }
         return { ok: true, conversation: project(resolve(row.id)) };
       });
+    },
+    saveDeviceHistory(id, value, { expectedRevision, expectedTransferId, expectedHistoryDigest } = {}) {
+      const data = JSON.stringify(value);
+      if (!value || !Array.isArray(value.snapshot?.messages) || !Array.isArray(value.snapshot?.tools) ||
+          Buffer.byteLength(data) > 128 * 1024 * 1024) throw Error('Invalid device history snapshot');
+      return transaction(() => {
+        const row = resolve(id);
+        if (!row || row.deleted || expectedRevision !== row.revision) return { ok: false, stale: true };
+        if (expectedTransferId !== undefined && (JSON.parse(row.data).deviceTransferId || '') !== expectedTransferId)
+          return { ok: false, stale: true };
+        if (expectedHistoryDigest !== undefined &&
+            (db.prepare('SELECT digest FROM device_history WHERE replica=?').get(row.id)?.digest ?? null) !== expectedHistoryDigest)
+          return { ok: false, stale: true };
+        const digest = crypto.createHash('sha256').update(data).digest('hex');
+        db.prepare(`INSERT INTO device_history VALUES(?,?,?,?) ON CONFLICT(replica)
+          DO UPDATE SET data=excluded.data,digest=excluded.digest,updated=excluded.updated
+          WHERE device_history.digest<>excluded.digest`).run(row.id, data, digest, Date.now());
+        return { ok: true, digest };
+      });
+    },
+    deviceHistoryVersion(id) {
+      const row = resolve(id);
+      return row && !row.deleted ? db.prepare('SELECT digest FROM device_history WHERE replica=?').get(row.id)?.digest : null;
+    },
+    deviceHistory(id) {
+      const row = resolve(id);
+      if (!row || row.deleted) return null;
+      const saved = db.prepare('SELECT * FROM device_history WHERE replica=?').get(row.id);
+      if (!saved) return null;
+      if (crypto.createHash('sha256').update(saved.data).digest('hex') !== saved.digest)
+        throw Error('Device history checksum mismatch');
+      return { ...JSON.parse(saved.data), digest: saved.digest, savedAt: saved.updated };
     },
     cache(id, messages, { start = 0, expectedRevision, complete = false } = {}) {
       bounded(start, 0, 1000000000);

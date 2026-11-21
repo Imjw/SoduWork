@@ -73,6 +73,8 @@ def run_bridge_case(proc, fixture, incoming, updates, report, reader):
         if item.get("type") == "text"
     )
     assert "PARENT_DONE" in text, "Python bridge did not emit the final parent answer"
+    receipts = [e["usage"]["total"] for e in updates if e.get("type") == "provider_usage"]
+    assert receipts == [14] * sum(fixture.calls.values()), "A settled parent or child model call was lost or repeated"
     report["productionPythonBridge"] = True
 
 
@@ -211,6 +213,9 @@ def run_truncated_tool_case(args, root, proc, fixture, incoming, updates, report
         return
     assert proc.returncode == 0 and not errors, "Recovery failed: " + str(errors)
     assert fixture.calls["parent"] == 3, "Expected one continuation, one write and final response"
+    assert [e["usage"]["total"] for e in updates if e.get("type") == "provider_usage"] == [14] * 3, (
+        "Truncation, continuation and tool response must each account for exactly one model call"
+    )
     assert native["turnEnds"] == ["max-tokens", "completed"], "Unexpected native turn history"
     assert native["toolCalls"] == [{"id": "fixture_finished_write", "name": "write"}], (
         "Final write did not execute exactly once"
@@ -462,6 +467,8 @@ def run_case(args, scenario, root, output, installation):
                 message, finish, sent = fixture.response(body)
                 usage_hook = getattr(fixture, "response_usage", None)
                 usage = usage_hook(body, message) if callable(usage_hook) else None
+                if scenario in {"bridge-truncated-tool", "bridge-child"}:
+                    usage = {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}
                 if finish == "error":
                     data = json.dumps(
                         {
@@ -542,7 +549,7 @@ def run_case(args, scenario, root, output, installation):
                 self.wfile.flush()
                 if sent:
                     sent.set()
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 fixture.observe("closed_fixture_connection")
             except Exception as exc:
                 fixture.failures.append(str(exc))

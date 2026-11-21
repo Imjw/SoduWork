@@ -39,7 +39,7 @@ function create({ app, session, history, action, identityOf, accountHistory }) {
     localReplica: true, updatedAt: new Date(Number(row.replicaUpdatedAt) || 0).toISOString(),
     createdAt: row.createdAt || '' };
   }
-  return async (args, guard) => {
+  return async (args, guard, directIdentityOf) => {
     if (args?.action === 'import') {
       await guard(true);
       const identity = await identityOf(app);
@@ -52,8 +52,11 @@ function create({ app, session, history, action, identityOf, accountHistory }) {
         Object.keys(args).some(key => !['action', 'id', 'after', 'limit', 'confirmed', 'segmentId', 'expectedRevision'].includes(key)))
       throw Error('会话操作内容不正确');
     const after = integer(args.after, 0, Number.MAX_SAFE_INTEGER), limit = integer(args.limit, 100, 200) || 100;
+    // A paired peer has already presented a current device certificate. Read
+    // only the local identity here, even near the Hub session renewal window.
+    const readerIdentity = directIdentityOf && ['list', 'read'].includes(args.action) ? directIdentityOf : identityOf;
     await guard(true);
-    const identity = await identityOf(app);
+    const identity = await readerIdentity(app);
     if (args.action === 'list') {
       const page = await history.directory(after, limit);
       await guard(true);
@@ -73,11 +76,11 @@ function create({ app, session, history, action, identityOf, accountHistory }) {
     if (row.deleted) {
       await guard(true);
       const access = require('../conversation/history-access'), captured = access.actor(app, identity);
-      access.assertLocalCurrent(app, captured, row, await identityOf(app));
+      access.assertLocalCurrent(app, captured, row, await readerIdentity(app));
       access.assertReadable(app, row.id, captured, row);
       return { conversation: metadata(row, identity), items: [], cursor: after, hasMore: false };
     }
-    const page = await history.read(row.id, { after, offset: after,
+    const page = await history.read(row.id, { after, offset: after, accountOnly: true,
       limit, segmentId: args.segmentId });
     await guard(true);
     const events = page.format === 'events';

@@ -14,11 +14,16 @@ from ..services import runner_hub
 from ..auth import sign_claims, verify_claims
 
 router = APIRouter(prefix="/api/v1/desktop-capabilities", tags=["mobile"])
+DESKTOP_PLATFORM = re.compile(r"(?:win32|darwin|linux)(?:/(?:x64|arm64|ia32))?", re.IGNORECASE)
 OPERATIONS = {"catalog", "library.call", "conversation.history", "skill.set", "plugin.get", "plugin.preflight", "plugin.install", "plugin.use"}
 
 
 def digest(body):
     return hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+
+
+def is_desktop(client):
+    return bool(DESKTOP_PLATFORM.fullmatch(str(getattr(client, "platform", "") or "")))
 
 
 def owner(client):
@@ -30,7 +35,8 @@ def owner(client):
 async def resolve(session, client, cid):
     uid = owner(client)
     target = await session.get(Client, cid, populate_existing=True)
-    if not target or target.auth_state != "active" or target.user_ref != uid:
+    if (not target or target.auth_state != "active" or target.user_ref != uid
+            or not is_desktop(target)):
         raise HTTPException(404, "未找到当前账号的电脑")
     runner = runner_hub.for_client(cid)
     if runner is None:
@@ -58,20 +64,18 @@ async def targets(client=Depends(current_client), session=Depends(get_session)):
                                                        Client.auth_state == "active"))).all()
     items = []
     for row in rows:
-        if row.id not in ids:
+        if row.id not in ids or not is_desktop(row):
             continue
         runner_id = ""
         library_ready = False
-        history_ready = False
         try:
             _, live = await resolve(session, client, row.id)
             runner_id = live.id
             library_ready = "desktopLibrary1" in live.caps
-            history_ready = "desktopHistory1" in live.caps
             ready, reason = True, ""
         except HTTPException as exc:
             ready, reason = False, str(exc.detail)
-        items.append({"id": row.id, "runnerId": runner_id, "name": row.name or "本人电脑", "ready": ready, "libraryReady": library_ready, "historyReady": history_ready, "reason": reason})
+        items.append({"id": row.id, "runnerId": runner_id, "name": row.name or "本人电脑", "ready": ready, "libraryReady": library_ready, "historyReady": False, "reason": reason})
     return {"items": items}
 
 
@@ -87,8 +91,13 @@ async def request(cid: str, body: dict = Body(...), client=Depends(current_clien
     _, runner = await resolve(session, client, cid)
     if body["operation"] == "library.call" and "desktopLibrary1" not in runner.caps:
         raise HTTPException(409, "请更新并重启这台电脑的 SoduWork 后使用资料库")
-    if body["operation"] == "conversation.history" and "desktopHistory1" not in runner.caps:
-        raise HTTPException(409, "请更新并重启这台电脑的 SoduWork 后访问本地会话")
+    if body["operation"] == "conversation.history":
+        # Only explicit recovery of old Hub content onto its original PC is supported.
+        args = body["args"]
+        if args.get("action") != "import" or cid != client.id:
+            raise HTTPException(410, "请使用设备直连访问本地会话")
+        if "desktopHistory1" not in runner.caps:
+            raise HTTPException(409, "请先更新来源电脑客户端")
     packet = {**body, "targetClientId": cid, "ownerUserId": uid}
     authorization = sign_claims({"uid": uid, "cid": cid, "digest": digest(packet)},
                                 ttl_seconds=120, token_type="desktop-capability")
@@ -104,17 +113,21 @@ async def request(cid: str, body: dict = Body(...), client=Depends(current_clien
     if current is not runner:
         raise HTTPException(409, "电脑连接已变化，请重新加载")
     if result.get("ok") is not True:
+        if body["operation"] == "conversation.history":
+            raise HTTPException(409, "电脑未完成历史恢复，请在来源电脑检查")
         raise HTTPException(409, result.get("error") or "电脑未完成操作")
     data = result.get("data") or {}
-    if body["operation"] == "plugin.use" and data.get("sourceSessionId"):
-        from ..account_conversation_models import AccountConversation
-        from .account_conversations import _conversation_json
-        row = await session.scalar(select(AccountConversation).where(
-            AccountConversation.owner_user_id == uid, AccountConversation.source_client_id == cid,
-            AccountConversation.source_session_id == data["sourceSessionId"],
-            AccountConversation.deleted.is_(False)))
-        if row:
-            data = {**data, "conversation": _conversation_json(row, client.id)}
+    if body["operation"] == "conversation.history":
+        # Recovery acknowledges only durable bytes already exported by Hub.
+        # Never turn the receipt into a general transcript return channel.
+        pointer = body["args"].get("pointer") or {}
+        if (not isinstance(data, dict) or data.get("ok") is not True or data.get("durable") is not True
+                or not re.fullmatch(r"migrated-[a-f0-9]{64}", str(data.get("id", "")))
+                or not re.fullmatch(r"[a-f0-9]{64}", str(data.get("sha256", "")))
+                or type(data.get("size")) is not int or not 0 <= data["size"] <= 128 * 1024 * 1024
+                or any(data.get(key) != pointer.get(key) for key in ("sha256", "size"))):
+            raise HTTPException(409, "本地历史恢复回执无效，原数据已保留")
+        return {key: data[key] for key in ("ok", "durable", "id", "sha256", "size")}
     return data
 
 
@@ -126,6 +139,8 @@ async def verify(body: dict = Body(...), client=Depends(current_client), session
     if (not claims or not isinstance(packet, dict) or claims.get("uid") != owner(client)
             or claims.get("cid") != client.id or claims.get("digest") != digest(packet)):
         raise HTTPException(403, "电脑操作授权已失效，请从手机重新发起")
+    if packet.get("operation") == "conversation.history" and (packet.get("args") or {}).get("action") != "import":
+        raise HTTPException(410, "请使用设备直连访问本地会话")
     await resolve(session, client, client.id)
     return {"ok": True}
 

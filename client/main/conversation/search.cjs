@@ -30,8 +30,12 @@ function create({ app, session, access = accessDefault, read, maxSessions = 500,
     if (result?.ok === false) throw Error(result.reason || 'SEARCH_HISTORY_UNAVAILABLE');
     const titles = require('./titles');
     const visible = access.visible ? access.visible(app, result.chats || [], captured.identity) : result.chats || [];
+    const sharedIds = new Set();
     const rows = visible.filter(row => {
-      try { readable(app, row.id, captured, row); return true; } catch (_) { return false; }
+      try {
+        if (readable(app, row.id, captured, row)?.sharedOnDevice) sharedIds.add(row.id);
+        return true;
+      } catch (_) { return false; }
     }).map(row => titles.decorate(app, row));
     const hits = [], matches = value => words.every(word => value.toLocaleLowerCase().includes(word));
     let partial = rows.length > maxSessions, cursor = 0;
@@ -46,7 +50,10 @@ function create({ app, session, access = accessDefault, read, maxSessions = 500,
         try {
           let offset = 0, found = false;
           for (let page = 0; page < maxPages; page++) {
-            const cacheable = typeof row.path === 'string' && require('node:path').isAbsolute(row.path) && Number(row.at) > 0 && Number.isSafeInteger(row.count);
+            // A native task or memory binding can change without a new message.
+            // Cross-account searches must recheck the archive before showing an excerpt.
+            const cacheable = !sharedIds.has(row.id) && typeof row.path === 'string' &&
+              require('node:path').isAbsolute(row.path) && Number(row.at) > 0 && Number.isSafeInteger(row.count);
             const key = JSON.stringify([row.id, row.path || '', row.at || 0, row.count || 0, offset]);
             const cached = pages.get(key);
             let data = cacheable && cached?.expires > Date.now() ? cached.data : null;
@@ -110,13 +117,14 @@ function install({ app, ipcMain, BrowserWindow, getRendererRoot }) {
     archivedConversation: (_app, id) => session.indexedHistoryRow(id),
     historyEntry: (...args) => require('../pi-session/session').historyEntry(...args),
   };
-  const metadata = require('../app-readonly-history.cjs').create({ app, session });
+  const access = { ...accessDefault, assertReadable: accessDefault.assertDeviceReadable, visible: accessDefault.visibleOnDevice };
+  const metadata = require('../app-readonly-history.cjs').create({ app, session, access });
   const searches = new Map();
   ipcMain.handle('conversation-search', async (event, query) => {
     if (!trusted(event)) throw Error('Search requires a trusted application window');
     let service = searches.get(event.sender.id);
     if (!service) {
-      service = create({ app, session: local, read: require('../app-readonly-history.cjs').create({ app, session: local,
+      service = create({ app, session: local, access, read: require('../app-readonly-history.cjs').create({ app, session: local, access,
         readCloud: async () => { throw Error('SEARCH_CLOUD_BODY_UNAVAILABLE'); } }) });
       searches.set(event.sender.id, service);
       event.sender.once('destroyed', () => { service.dispose(); searches.delete(event.sender.id); });

@@ -113,6 +113,42 @@ if (typeof electron === 'string') {
     assert(gallery.every(frame => Math.abs(frame.w - gallery[0].w) < 1));
     assert.equal(await run('list.scrollWidth > list.clientWidth'), false);
     report.cases.push({ narrowGallery: gallery });
+    await run(fs.readFileSync(path.join(client, 'components/panels/chat-deliveries.js'), 'utf8') + '\nvoid 0;');
+    await run(`window.SoduWorkI18n = undefined;
+      window.historyFiles = [
+        { artifactId: 'final', name: 'index.html', relative: 'index.html', primary: true },
+        { artifactId: 'unmentioned', name: 'notes.pdf', relative: 'exports/notes.pdf', primary: true },
+        ...['shots/menu.png', 'shots/fight.png', 'other/lost.png', 'old/ko.png', 'old/ko.png'].map((relative, i) =>
+          ({ artifactId: 's' + i, relative, name: relative.split('/').pop(), primary: false, processEvidence: true }))
+      ];
+      window.paintHistory = (files, urls) => {
+        const md = '<div class="nmd"><p>Open <code>index.html</code></p><pre><code class="language-soduwork-media">' +
+          JSON.stringify({ type: 'gallery', items: urls.map(url => ({ url })) }) + '</code></pre></div>';
+        list.innerHTML = ChatOutputLinks.decorate('<div class="nmsg ai" data-delivery-final="true">' +
+          ChatMedia.prepare(md, 'history') + '</div>', files, 'history', { localReplica: true, status: 'idle' });
+      };
+      window.historyReads = [];
+      paintHistory(historyFiles, ['shots/menu.png', './shots/fight.png', 'shots/lost.png', 'old/ko.png']);
+      ChatMedia.hydrate(list);
+      ChatOutputLinks.hydrateImages(list, historyFiles, { ref: 'history', api: { artifactAction: async (...args) => {
+        historyReads.push(args);
+        return { ok: true, mimeType: 'image/png', data: ${JSON.stringify(png(48, 32))} };
+      } } });
+    `);
+    assert.deepEqual(await run(`[...list.querySelectorAll('.nmd [data-output-image]')].map(n => n.dataset.outputImage)`), ['s0', 's1']);
+    await until('list.querySelectorAll(".nmd img").length === 2 && [...list.querySelectorAll(".nmd img")].every(n => n.naturalWidth === 48)');
+    assert.deepEqual(await run('historyReads'), [['history', 's0', 'image-full'], ['history', 's1', 'image-full']]);
+    assert.equal(await run('list.querySelector(".ndelivery [data-open-app]").dataset.openApp'), 'final');
+    assert.deepEqual(await run(`[...list.querySelectorAll(':scope > .ndelivery [data-open-app]')].map(n => n.dataset.openApp)`), ['unmentioned']);
+    assert.equal(await run('list.querySelectorAll("[data-delivery-retry],[data-delivery-reveal],[data-delivery-archive]").length'), 0);
+    assert.deepEqual(await run(`[...list.querySelectorAll('.nmd [role="status"]')].map(n => n.textContent).filter(Boolean)`),
+      ['图片暂时无法预览 · shots/lost.png', '图片暂时无法预览 · old/ko.png']);
+    await run(`paintHistory([], ['shots/lost.png']); void 0;`);
+    assert.equal(await run('list.querySelector(".nmd [role=status]").textContent'), '图片暂时无法预览 · shots/lost.png');
+    assert.equal(await run('list.querySelectorAll("button,img,a").length'), 0);
+    await run(`paintHistory(historyFiles, ['shots/menu.png', '../shots/fight.png']); void 0;`);
+    assert.equal(await run('Boolean(list.querySelector("pre code")) && !list.querySelector("img")'), true);
+    report.cases.push({ historyGallery: 'two decoded screenshots, two unavailable entries, one message output and one session output' });
     report.ok = true;
   }).catch(error => { report.error = error.stack || String(error); }).finally(() => {
     fs.mkdirSync(output, { recursive: true });

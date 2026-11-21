@@ -11,6 +11,7 @@ function fixture(workflow = false) {
   const handle = { ref: 'original', sessionId: 'native-original', cwd: '/fixture',
     submit: async () => { native++; return submitted(); } };
   const modules = {
+    '../conversation/device-local-continuation.cjs': require('../main/conversation/device-local-continuation.cjs'),
     '../requirement-diagnostics.cjs': require('../main/requirement-diagnostics.cjs'),
     '../device-auth-request': require('../main/device-auth-request'),
     './skill-turn': require('../main/pi-session/skill-turn'),

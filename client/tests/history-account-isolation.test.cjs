@@ -40,8 +40,8 @@ test('A to B to A scopes pages, catalog aliases/origins, archives and direct cac
   await f.cached('a', f.a, { historyAliasIds: ['alias-a'], source: { id: 'source-a', account: 'one', hub: f.a.hub } });
   await f.cached('b', f.b, { historyAliasIds: ['alias-b'], source: { id: 'source-b', account: 'two', hub: f.b.hub } });
   await f.cached('a-archived', f.a); await f.store.lifecycle('a-archived', 'archive');
-  await f.history.register([{ id: 'unknown', count: 1, path: path.join(f.root, 'unknown.jsonl') },
-    f.row('conflict', f.a, { workOwner: scope(f.b) })]);
+  await f.history.register([{ id: 'unknown', count: 1, importedHistory: true, path: path.join(f.root, 'unknown.jsonl') },
+    f.row('conflict', f.a, { workOwner: scope(f.b), historyProtection: 'account' })]);
   const before = await f.store.catalog(); let aWorkspace;
   for (const [owner, expected] of [[f.a, 'a'], [f.b, 'b'], [f.a, 'a']]) {
     f.current = owner;
@@ -67,7 +67,8 @@ test('A to B to A scopes pages, catalog aliases/origins, archives and direct cac
 });
 test('authorized pagination crosses foreign and unknown entries; metadata directory and cursor validation agree', async t => {
   const f = await fixture(t);
-  await f.history.register(Array.from({ length: 80 }, (_, i) => f.row('item-' + i, i % 3 ? f.b : f.a, { at: i })));
+  await f.history.register(Array.from({ length: 80 }, (_, i) => f.row('item-' + i, i % 3 ? f.b : f.a,
+    { at: i, historyProtection: 'account' })));
   const rows = []; let after, catalog;
   do {
     const page = await f.history.page({ limit: 5, after, workspace: catalog?.workspace, catalogRevision: catalog?.revision });
@@ -83,11 +84,13 @@ test('authorized pagination crosses foreign and unknown entries; metadata direct
     await assert.rejects(f.history.page(options), /Invalid|workspace/);
   for (const args of [[-1, 5], [0, 0], [0, 201], [NaN, 1]]) await assert.rejects(f.history.directory(...args), /Invalid/);
 });
-test('unknown native ownership is never claimed and sidecar conflicts invalidate cached catalogs immediately', async t => {
+test('unknown imported ownership is never claimed and protected sidecar conflicts invalidate catalogs immediately', async t => {
   const f = await fixture(t), file = path.join(f.root, 'pi-agent', 'sessions', 'native.jsonl');
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify({ type: 'message', message: { role: 'user', content: 'native text' } }) + '\n');
-  await f.history.register([{ id: 'unknown', path: file, count: 1, adapterId: 'pi' }, f.row('owned', f.a, { path: file })]);
+  fs.writeFileSync(file, [ { type: 'session', id: 'owned' },
+    { type: 'message', message: { role: 'user', content: 'native text' } } ].map(value => JSON.stringify(value)).join('\n') + '\n');
+  await f.history.register([{ id: 'unknown', path: file, count: 1, adapterId: 'pi', importedHistory: true },
+    f.row('owned', f.a, { path: file, historyProtection: 'account' })]);
   assert.throws(() => access.assertOwner(f.app, 'unknown', access.actor(f.app, f.a), { id: 'unknown', path: file, count: 1 }, { allowLegacy: true }), /当前账号/);
   assert.equal(fs.existsSync(path.join(f.root, 'conversation-history-owners')), false);
   assert.equal(await f.history.open('unknown'), null);
@@ -277,6 +280,25 @@ test('linked owner metadata fails closed without granting the target owner or ch
   assert.equal(fs.readFileSync(target, 'utf8'), bytes);
 });
 
+test('one local mutation checks the runtime parent index once and the next mutation checks it again', async t => {
+  const f = await fixture(t);
+  const access = require('../main/conversation/history-access');
+  const segments = require('../main/conversation/runtime-segments');
+  const lookup = t.mock.method(segments, 'identities');
+  const row = f.row('local-draft', f.a, { localReplica: true, workOwner: undefined, historyProtection: undefined });
+  const actor = access.actor(f.app, f.a);
+  access.assertLocalMutation(f.app, row.id, actor, row);
+  assert.equal(lookup.mock.callCount(), 1);
+  await segments.save(f.app, { version: 1, id: 'foreign-parent', owner: scope(f.b), segments: [],
+    active: { adapterId: 'pi', sessionId: row.id } });
+  const contexts = path.join(f.root, 'requirement-session-context');
+  fs.mkdirSync(contexts);
+  fs.writeFileSync(path.join(contexts, crypto.createHash('sha256').update('foreign-parent').digest('hex') + '.json'),
+    JSON.stringify({ version: 1, owner: scope(f.b) }));
+  assert.throws(() => access.assertLocalMutation(f.app, row.id, actor, row));
+  assert.equal(lookup.mock.callCount(), 2);
+});
+
 test('an invalid runtime parent index cannot authorize later catalog rows after its first failure', async t => {
   const f = await fixture(t);
   await f.history.register(['one', 'two', 'three'].map(id => f.row(id, f.a, { historyAliasIds: [id + '-alias'] })));
@@ -325,7 +347,7 @@ test('native body reads reject a fresh transcript owner that conflicts with the 
     { type: 'custom', customType: 'soduwork.work-entry', data: { version: 1, owner: scope(owner) } },
     { type: 'message', message: { role: 'user', content: 'account-private-body' } },
   ].map(row => JSON.stringify(row)).join('\n'));
-  write(f.a); await f.history.register([f.row('native', f.a, { path: file })]);
+  write(f.a); await f.history.register([f.row('native', f.a, { path: file, historyProtection: 'account' })]);
   f.session.historyEntry = require('../main/pi-session/session').historyEntry;
   assert.equal((await f.history.read('native')).items[0].text, 'account-private-body');
   write(f.b);
@@ -346,7 +368,8 @@ test('ten thousand mixed-account rows keep authorized paging bounded and reuse o
   const f = await fixture(t), { performance } = require('node:perf_hooks');
   for (let from = 0; from < 10000; from += 200) await f.history.register(Array.from({ length: 200 }, (_, offset) => {
     const index = from + offset;
-    return f.row('large-' + index, index % 2 ? f.b : f.a, { at: index, historyAliasIds: ['segment-' + index] });
+    return f.row('large-' + index, index % 2 ? f.b : f.a,
+      { at: index, historyAliasIds: ['segment-' + index], historyProtection: 'account' });
   }));
   let heartbeat = 0;
   const timer = setInterval(() => heartbeat++, 1), start = performance.now();

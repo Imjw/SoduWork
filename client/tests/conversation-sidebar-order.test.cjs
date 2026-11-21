@@ -164,8 +164,11 @@ test('history deletion confirms and routes both Pi archives and Runner records',
   // Pi archives now pass through recycle readiness checks before native delete.
   assert.match(ipc, /trash = trashWithRecovery/);
   assert.match(ipc, /await trash\(shell, piEntry\.path\)/);
-  assert.match(ipc, /session\.findRunnerRow\(id, \{ strict: true \}\)/);
+  assert.match(ipc, /session\.findRunnerRow\(id, \{ strict: true, metadataOnly: true \}\)/);
   assert.match(ipc, /session\.forgetRunner\(app, id\)/);
+  const localActions = fs.readFileSync(path.join(__dirname, '../main/pi-session/local-history-actions.cjs'), 'utf8');
+  assert.match(localActions, /session\.permanentlyDeleteHistory\(app, row\.id, \{ localOnly: true \}\)/);
+  assert.match(localActions, /session\.forgetRunner\(app, row\.id, \{ localOnly: true, adapterId: row\.adapterId \}\)/);
   assert.match(source, /const canDelete = Boolean\(id\) && !c\.pending/);
   const archives = fs.readFileSync(path.join(__dirname, '../main/pi-session/archive-history.js'), 'utf8');
   assert.match(session, /_historyIndex\(app\)\.find\(wanted, \{ strict: options\.strict === true \}\)/);

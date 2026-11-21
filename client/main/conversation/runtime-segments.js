@@ -15,6 +15,7 @@ const location = (app, id) => path.join(root(app), crypto.createHash('sha256').u
 const cache = new Map();
 const cacheStamps = new Map();
 const writes = new Map();
+const MAX_SEGMENTS = 1000;
 
 function read(app, id) {
   if (!app?.getPath || !id) return null;
@@ -42,7 +43,7 @@ function snapshot(app, file) {
     const row = JSON.parse(bytes.toString('utf8'));
     if (row.version !== 1 || typeof row.id !== 'string' || !row.id ||
         location(app, row.id) !== file || !row.active?.adapterId || !row.active?.sessionId ||
-        !Array.isArray(row.segments) || row.segments.length > 1000) throw Error('invalid');
+        !Array.isArray(row.segments) || row.segments.length > MAX_SEGMENTS) throw Error('invalid');
     cache.set(file, row); cacheStamps.set(file, revision); return { revision, record: row };
   } catch (error) {
     cache.delete(file); cacheStamps.delete(file);
@@ -51,6 +52,7 @@ function snapshot(app, file) {
   }
 }
 async function write(app, row) {
+  if (row.segments?.length > MAX_SEGMENTS) throw Error('会话执行段已达到上限，已保留原有历史');
   const file = location(app, row.id), temporary = file + '.' + crypto.randomUUID() + '.tmp';
   await fsp.mkdir(root(app), { recursive: true });
   try {

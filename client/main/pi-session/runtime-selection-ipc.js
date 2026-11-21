@@ -9,7 +9,8 @@ function install({ app, ipcMain, session, identityOf, memories, cloud, publish }
     const identity = await identityOf(app);
     if (!identity) throw Error('请先登录');
     if (session.get(ref) !== handle) throw Error('会话已关闭，请重新打开');
-    memories.assertOwner(identity, handle.sessionId);
+    if (!require('../conversation/device-local-continuation.cjs').guard(handle, identity))
+      memories.assertOwner(identity, handle.sessionId);
     require('../conversation/requirement-context').identityMatches(handle, identity);
     return handle;
   }

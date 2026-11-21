@@ -3,6 +3,71 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
+test('disabled account sync never reads identities, histories, queues or starts network work', async () => {
+  const touched = [];
+  const unexpected = name => () => { touched.push(name); throw Error('Unexpected ' + name); };
+  const store = new Proxy({}, { get: (_target, name) => unexpected('store.' + String(name)) });
+  const sync = require('./account-sync').create({ enabled: false, app: {}, store,
+    identityOf: unexpected('identity'), localIdentityOf: unexpected('local identity'),
+    resolveNativeSource: unexpected('native history'), resolveDisplayLinks: unexpected('display links'),
+    preserveLegacyOutbox: unexpected('outbox migration'), fetch: unexpected('network'),
+    discovery: new Proxy({}, { get: (_target, name) => unexpected('discovery.' + String(name)) }),
+    realtime: true, retryMs: 1 });
+  const handle = { sessionId: 'native-private', snapshot: unexpected('snapshot'), on: unexpected('listen') };
+  assert.equal(sync.bind(handle, { clientId: 'desktop' }), null);
+  assert.equal(Object.hasOwn(handle, 'accountSync'), false);
+  assert.deepEqual(await sync.flush(), { ok: true, disabled: true });
+  for (const options of [{}, { archived: true, force: true, source: 'account' }])
+    assert.deepEqual(await sync.history(options), { ok: true, disabled: true, chats: [], lifecycle: [] });
+  assert.equal(await sync.row('acct-legacy'), null);
+  assert.equal(await sync.openProjection('acct-legacy'), null);
+  assert.equal(sync.sourceProjection('native-private', { clientId: 'desktop' }), null);
+  assert.equal(sync.isAccountConversation('acct-legacy'), false);
+  assert.equal(sync.isRemote('acct-legacy'), false);
+  assert.deepEqual(await sync.jobs(), []);
+  sync.onChange(unexpected('change event'))();
+  const local = await sync.resolveLifecycle('native-private', { prepare: true });
+  assert.equal(local.ok, true); assert.equal(local.found, false); assert.equal(local.localOnly, true);
+  assert.equal((await sync.setLifecycle('native-private', 'archive')).localOnly, true);
+  assert.equal((await sync.setLifecycle('native-private', 'unsupported')).ok, false);
+  assert.equal((await sync.resolveLifecycle('acct-legacy')).ok, false);
+  assert.equal((await sync.setLifecycle('acct-legacy', 'delete')).ok, false);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.deepEqual(touched, []);
+});
+
+test('disabled account sync retains durable pending uploads and cached directories across shutdown', async t => {
+  const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+  const { create: createStore } = require('./account-sync-store');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'account-sync-disabled-'));
+  const file = path.join(root, 'outbox.json'), store = createStore(file, { persistent: true });
+  t.after(() => {
+    store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const job = { id: 'retained-upload', hub: 'http://hub.test', ownerKey: 'alice', clientId: 'desktop',
+    body: { sourceSessionId: 'native-private', sourceEpoch: 'legacy', sourceRevision: 1,
+      messages: [{ role: 'user', text: 'Synthetic pending local history', position: 0 }] } };
+  store.checkpointAndEnqueue('native-checkpoint', { sourceRevision: 1 }, job);
+  store.saveDirectory('legacy-account', [{ id: 'acct-legacy', title: 'Synthetic old directory', revision: 1 }], 1);
+  const before = { jobs: store.jobs(), session: store.session('native-checkpoint'), directory: store.directory('legacy-account') };
+  let closes = 0;
+  const originalClose = store.close;
+  store.close = () => { closes++; originalClose(); };
+  const sync = require('./account-sync').create({ enabled: false, app: {}, store,
+    identityOf: () => { throw Error('Disabled synchronization must not request credentials'); },
+    fetch: () => { throw Error('Disabled synchronization must not upload pending content'); } });
+  assert.deepEqual(await sync.flush(), { ok: true, disabled: true });
+  const first = sync.close();
+  assert.equal(sync.close(), first);
+  await first;
+  assert.equal(closes, 1);
+  const reopened = createStore(file);
+  assert.deepEqual({ jobs: reopened.jobs(), session: reopened.session('native-checkpoint'),
+    directory: reopened.directory('legacy-account') }, before);
+  reopened.close();
+});
+
 test('unchanged local transcripts retain their revision across polling and reopen', async t => {
   const session = Buffer.from(JSON.stringify({ typ: 'device', uid: 'alice', cid: 'desktop',
     exp: 9999999999 })).toString('base64url') + '.' + 'a'.repeat(64);

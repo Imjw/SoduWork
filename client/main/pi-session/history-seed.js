@@ -49,7 +49,8 @@ function _seed(acc, piSession, options) {
   try { entries = piSession.sessionManager && piSession.sessionManager.getEntries() || []; } catch (e) { entries = []; }
   const hasEntryMessages = entries.some((item) => item && item.type === 'message' && item.message);
   const sequence = hasEntryMessages ? entries : msgs.map((message) => ({ type: 'message', message }));
-  const { tailStart, lastFinalEntry } = snapshotWindow.seedBounds(sequence, opts.maxMessages, goalFinalizer.ENTRY_TYPE);
+  const bounds = snapshotWindow.seedBounds(sequence, opts.maxMessages, goalFinalizer.ENTRY_TYPE);
+  const { tailStart, lastFinalEntry } = opts.completeHistory === true ? { ...bounds, tailStart: 0 } : bounds;
   // Keep only the clipped turn's identity/receipt, not its old content. A
   // long tool turn can otherwise lose its outcome when its user is windowed out.
   const prefix = stream.create();

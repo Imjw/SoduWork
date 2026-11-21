@@ -6,9 +6,10 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+import uuid
 from unittest.mock import Mock, patch
 
-from app.services import acp_agents, local_base, qwen_runtime
+from app.services import acp_agents, local_base, qwen_runtime, qwen_tool_history
 
 
 class QwenRuntimeTests(unittest.TestCase):
@@ -294,6 +295,77 @@ class QwenRuntimeTests(unittest.TestCase):
         env = {"keep": "value"}
         qwen_runtime.configure(env, {}, str(self.root))
         self.assertEqual(env, {"keep": "value"})
+
+
+class QwenCancelledWriteHistoryTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name).resolve()
+        self.store = self.root / "local-runs"
+        self.meta = self.store / "run-1" / "meta.json"
+        self.meta.parent.mkdir(parents=True)
+        self.sid = str(uuid.uuid4())
+        self.workspace = str(self.root / "workspace")
+        self.metadata = {"ref": "run-1", "ws": self.workspace, "cli": "qwen", "cliSid": self.sid,
+                         "seq": 5, "state": "interrupted", "failureKind": "access_reauthorization",
+                         "eventDestination": "local"}
+        self.meta.write_text(json.dumps(self.metadata), encoding="utf-8")
+        workspace = self.workspace.lower() if os.name == "nt" else self.workspace
+        key = "".join(c if c.isascii() and c.isalnum() else "-" for c in workspace)
+        self.file = self.root / ".qwen" / "projects" / key / "chats" / (self.sid + ".jsonl")
+        self.file.parent.mkdir(parents=True)
+        self.header = {"uuid": "root", "parentUuid": None, "sessionId": self.sid, "cwd": self.workspace,
+                       "type": "system", "provenance": "system", "subtype": "session_model"}
+        self.event = {"v": 1, "kind": "tool", "event.name": "tool_lifecycle", "sessionId": self.sid,
+                      "executionId": str(uuid.uuid4()), "callId": "w", "toolName": "write_file",
+                      "phase": "ended", "outcome": "cancelled", "executionStatus": "not_started", "endedAt": 1}
+        self.request = {"ref": "run-1", "revision": 5, "calls": ["w"]}
+
+    def save(self, *events, **row_fields):
+        rows = [self.header]
+        for i, event in enumerate(events):
+            rows.append({**self.header, "uuid": str(i), "parentUuid": rows[-1]["uuid"], "subtype": "ui_telemetry",
+                         "systemPayload": {"uiEvent": event}, **row_fields})
+        self.file.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    def lookup(self, **request):
+        return qwen_tool_history.lookup(str(self.store), {**self.request, **request})
+
+    def test_requires_exact_unstarted_cancelled_write_and_single_linear_session(self):
+        self.save(self.event)
+        confirmed = self.lookup()
+        self.assertEqual(confirmed["callIds"], ["w"])
+        self.assertEqual(len(confirmed["binding"]), 64)
+        for change in ({"executionStatus": "running"}, {"phase": "started"}, {"outcome": "error"},
+                       {"callId": "other"}, {"toolName": "run_shell_command"}, {"sessionId": str(uuid.uuid4())}):
+            self.save({**self.event, **change})
+            self.assertFalse(self.lookup().get("callIds"))
+        self.save(self.event, self.event)
+        self.assertFalse(self.lookup().get("callIds"))
+        for row_fields in ({"cwd": "/other"}, {"parentUuid": "unrelated"},
+                           {"type": "assistant"}, {"provenance": "model"}):
+            self.save(self.event, **row_fields)
+            self.assertFalse(self.lookup().get("callIds"))
+        self.save(self.event)
+        self.assertEqual(self.lookup(revision=4), {})
+        self.metadata.update(eventDestination="hub")
+        self.meta.write_text(json.dumps(self.metadata), encoding="utf-8")
+        self.assertEqual(self.lookup(), {})
+
+    def test_absence_is_distinct_from_an_unreadable_cancelled_write_receipt(self):
+        self.save(self.event)
+        confirmed = self.lookup()
+        self.file.unlink()
+        self.assertEqual(self.lookup(), {**confirmed, "archiveMissing": True, "callIds": []})
+        self.file.write_text("corrupt", encoding="utf-8")
+        self.assertEqual(self.lookup(), {})
+        self.file.unlink()
+        try:
+            self.file.symlink_to(self.root / "missing")
+        except OSError:
+            return
+        self.assertEqual(self.lookup(), {})
 
 
 if __name__ == "__main__":

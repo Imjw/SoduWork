@@ -76,7 +76,9 @@ async function soleModel(identity, fetchImpl, signal) {
   return names.size === 1 ? [...names][0] : '';
 }
 function create({ app, authenticatedIdentityOf, authorizeAI, fetchImpl = global.fetch,
-  resolveModel = modelConfig.fetchModel, useModelOutputLimit = false }) {
+  resolveModel = modelConfig.fetchModel, useModelOutputLimit = false, readCompletion = choice => ({
+    text: choice?.message?.content, finishReason: choice?.finish_reason === 'length' ? 'length' : 'stop',
+  }) }) {
   const receipts = new WeakMap(), active = new Map();
   return async function generate(item, raw, assertCurrent = () => {}) {
     const params = normalize(raw);
@@ -175,16 +177,16 @@ function create({ app, authenticatedIdentityOf, authorizeAI, fetchImpl = global.
         }
         const result = await boundedJSON(response);
         await current();
-        const choice = result?.choices?.[0];
-        const text = choice?.message?.content;
+        const completion = readCompletion(result?.choices?.[0]);
+        if (completion.ok === false) return completion;
+        const { text, finishReason } = completion;
         if (typeof text !== 'string' || !text.trim() || text.length > 262144)
           return { ...failure('APP_AI_EMPTY_RESULT', '模型未返回可用文字，请调整提示词或模型'),
-            ...(choice?.finish_reason === 'length' ? { finishReason: 'length' } : {}) };
+            ...(finishReason === 'length' ? { finishReason } : {}) };
         const usage = {};
         for (const [key, source] of [['inputTokens', 'prompt_tokens'], ['outputTokens', 'completion_tokens'], ['totalTokens', 'total_tokens']])
           if (Number.isSafeInteger(result.usage?.[source]) && result.usage[source] >= 0) usage[key] = result.usage[source];
-        return { ok: true, requestId: params.requestId, text, model: model.id, usage,
-          finishReason: choice.finish_reason === 'length' ? 'length' : 'stop' };
+        return { ok: true, requestId: params.requestId, text, model: model.id, usage, finishReason };
       } catch (error) {
         if (!localRequested && error?.code === 'TOKEN_QUOTA_EXCEEDED') return failure(error.code, '当前 AI 使用额度暂不可用，请查看额度详情');
         // Never surface provider bodies, headers, URLs or tickets to the app.

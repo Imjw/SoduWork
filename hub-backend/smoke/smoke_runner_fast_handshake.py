@@ -110,6 +110,10 @@ async def _checks() -> None:
             return {"ok": True, "issueId": "fast-ack-ref", "identifier": "LOCAL-fast"}
 
         ai_local.dispatch_sync = fake_dispatch
+        # Keep dispatch preflight deterministic: this deadline measures the ACK
+        # path, while capability security has separate inventory coverage.
+        runner_main._capabilities = lambda *_args, **_kwargs: {
+            "schemaVersion": 3, "available": ["terminal"], "items": []}
 
         async def forbidden_beat():
             raise AssertionError("dispatch ACK must not wait for a full heartbeat")
@@ -126,6 +130,7 @@ async def _checks() -> None:
         await asyncio.wait_for(launched.wait(), timeout=2)
     finally:
         ai_local.dispatch_sync = old_dispatch
+        runner_main._capabilities = old_capabilities
 
     probe_code = (
         "import subprocess,sys,time;"

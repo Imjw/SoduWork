@@ -89,6 +89,7 @@ function create({ app, identityOf, find, open, send, sync, fetch = fetchWithDevi
       }
       captured = fingerprint(handle);
       const synced = await sync();
+      if (synced?.disabled === true) throw Error('本机会话账号同步已停用，请在来源电脑继续会话');
       if (synced?.ok === false) throw Error('来源聊天尚未同步完成，请稍后重试');
       await assertIdentity(identity);
     } catch (error) { failure = String(error.message || error); }

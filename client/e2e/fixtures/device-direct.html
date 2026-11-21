@@ -1,0 +1,21 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="../../components/client-auth/device-direct.css"></head><body>
+<button id="open">Open device connections</button>
+<script>
+window.owner='owner-a';window.calls=[];window.listening=false;
+window.source={ref:'ref-a',sessionId:'session-a',title:'Synthetic conversation'};
+window.SoduWorkAPI={taskStorageKey:()=>owner+'-device-direct'};
+window.NativeChat={sessionInfo:()=>source};
+window.soduWorkAPI={deviceDirect:{
+status:async()=>({ready:true,listening,endpoints:['tls://127.0.0.1:4343']}),
+peers:async()=>[{peerId:'desktop-b',deviceId:'desktop-b',role:'desktop',connected:true},{peerId:'phone-c',deviceId:'phone-c',role:'mobile',connected:true}],
+listen:async value=>{calls.push(['listen',value]);listening=true;},stop:async()=>{listening=false;},
+offer:async()=>({offer:'synthetic-once',deviceId:'desktop-a',endpoints:['tls://127.0.0.1:4343']}),
+connect:async value=>{calls.push(['connect',value]);},disconnect:async()=>{},
+migration:{
+preview:async value=>({operationId:'op-synthetic',...value,state:'preview',files:[{path:'chosen.txt',size:24},{path:'other.txt',size:10}],totalBytes:34,excludedCount:2,workspaceNotice:'Synthetic <workspace> notice; history can still transfer.'}),
+start:async value=>{calls.push(['start',value]);return{state:'done'};},
+status:async()=>({state:'done'}),resume:async()=>({state:'done'}),cancel:async()=>({state:'aborted'})
+}}};
+</script><script src="../../components/client-auth/device-direct.js"></script><script>
+document.querySelector('#open').onclick=()=>DeviceDirect.open({source});
+</script></body></html>

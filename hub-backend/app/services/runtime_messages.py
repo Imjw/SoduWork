@@ -1,5 +1,6 @@
 """Normalize only explicitly exposed native thought/text and settled token data."""
 from __future__ import annotations
+import json
 import math
 
 
@@ -65,6 +66,8 @@ def usage(value):
 def billed_event(m):
     """Never treat a context watermark or a replayed partial as consumption."""
     kind = m.get("type")
+    if kind == "provider_usage":
+        return m.get("usage"), "provider"
     if kind == "step_finish" and not m.get("contextOnly"):
         part = m.get("part") or {}
         tokens = part.get("tokens")
@@ -178,6 +181,52 @@ def augment(m, run, rows):
     additional = state.pop("additional", [])
     usage_row = state.pop("usage", None)
     result = additional + rows + ([usage_row] if usage_row else [])
+    return result
+
+
+def native_tool_results(run: dict, event: object) -> list[dict]:
+    """Project identifiable native terminal tool results into public Runner history."""
+    if not isinstance(event, dict):
+        return []
+    cli, result = run.get("cli"), []
+    if cli == "codex" and event.get("type") == "item.completed":
+        item = event.get("item")
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"]:
+            return []
+        kind, status = item.get("type"), item.get("status")
+        if kind != "web_search" and status not in {"completed", "failed"}:
+            return []
+        if kind == "command_execution":
+            if status == "completed" and type(item.get("exit_code")) is not int:
+                return []
+            success = status == "completed" and item.get("exit_code") == 0
+            result.append({"kind": "out", "tool": kind, "callId": item["id"],
+                           "isError": not success, "full": str(item.get("aggregated_output") or "")[:20000]})
+        elif kind == "file_change":
+            changes = [{key: entry[key] for key in ("path", "kind") if isinstance(entry.get(key), str)}
+                       for entry in item.get("changes") or [] if isinstance(entry, dict)]
+            result.append({"kind": "out", "tool": kind, "callId": item["id"],
+                           "isError": status != "completed", "full": json.dumps(changes, ensure_ascii=False)[:20000]})
+        elif kind == "mcp_tool_call":
+            value = item.get("result")
+            text = _exposed(value.get("content")) if isinstance(value, dict) else ""
+            result.append({"kind": "out", "tool": kind, "callId": item["id"],
+                           "isError": status != "completed" or bool(item.get("error")),
+                           "full": text[:20000]})
+        elif kind == "web_search":
+            # Completion closes this native tool, but no result receipt is exposed.
+            result.append({"kind": "out", "tool": kind, "callId": item["id"]})
+    elif cli == "opencode" and event.get("type") == "tool_use":
+        part = event.get("part")
+        state = part.get("state") if isinstance(part, dict) else None
+        identity = (part.get("callID") or part.get("callId") or part.get("id")) if isinstance(part, dict) else None
+        if isinstance(identity, str) and identity and isinstance(state, dict) and state.get("status") in {"completed", "error"}:
+            result.append({"kind": "out", "tool": part.get("tool"),
+                           "callId": identity,
+                           "isError": state["status"] != "completed" or bool(state.get("error")),
+                           "full": str(state.get("output") or "")[:20000]})
+    for row in result:
+        row["text"] = row.get("full", "")[:300]
     return result
 
 

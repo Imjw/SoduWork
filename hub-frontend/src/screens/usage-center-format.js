@@ -35,11 +35,14 @@ export function when(value) {
   return date.toLocaleString(getLocale(), { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
 }
 
-export const agentName = (key) => AGENT_NAMES[String(key || '').toLowerCase()] || key || tx("未知 Agent")
+export const agentName = (key, names) => names && Object.hasOwn(names, key)
+  ? names[key] : AGENT_NAMES[String(key || '').toLowerCase()] || key || tx("未知 Agent")
 export const ratio = (value, total) => total > 0 ? Math.min(100, numeric(value) * 100 / total) : 0
-export const share = (value, total) => {
+export const share = (value, total, digits = 0) => {
   const percent = ratio(value, total)
-  return percent > 0 && percent < 1 ? '<1%' : Math.round(percent) + '%'
+  const threshold = 10 ** -digits
+  if (percent > 0 && percent < threshold) return '<' + threshold.toLocaleString(getLocale()) + '%'
+  return percent.toLocaleString(getLocale(), { maximumFractionDigits: digits }) + '%'
 }
 
 // These labels are system enums. Unknown source names remain business data.

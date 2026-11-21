@@ -18,7 +18,7 @@ from app.services.runner_desktop_capabilities import DesktopCapabilities, PREFIX
 class AccessTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.client = Row(id="phone", user_ref="owner", auth_state="active")
-        self.target = Row(id="pc", user_ref="owner", auth_state="active")
+        self.target = Row(id="pc", user_ref="owner", auth_state="active", platform="darwin")
         self.node = Row(id="runner", client_id="pc", owner_user_id="owner", org_id="org", auth_state="active", management_state="")
         self.runner = Row(id="runner", client_id="pc", owner_user_id="owner", org_id="org", caps=["desktopCapabilities1"],
                           call=AsyncMock(return_value={"ok": True, "data": {"plugins": []}}))
@@ -34,10 +34,47 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["ownerUserId"], "owner")
         self.assertEqual(payload["targetClientId"], "pc")
 
+    async def test_mobile_unknown_and_foreign_sources_cannot_read_history_despite_capabilities(self):
+        self.runner.caps.append("desktopHistory1")
+        body = {**self.body, "operation": "conversation.history", "args": {"action": "list"}}
+        for platform in ("android", "ios", "mobile", "web", "", None):
+            with self.subTest(platform=platform):
+                self.target.platform = platform
+                with self.assertRaises(HTTPException) as denied:
+                    await api.request("pc", body, self.client, self.session)
+                self.assertEqual(denied.exception.status_code, 404)
+        self.runner.call.assert_not_awaited()
+        for platform in ("win32", "darwin", "linux", "win32/x64", "darwin/arm64", "linux/x64"):
+            self.target.platform = platform
+            with self.assertRaises(HTTPException) as direct_only:
+                await api.request("pc", body, self.client, self.session)
+            self.assertEqual(direct_only.exception.status_code, 410)
+            self.assertEqual(await api.request("pc", self.body, self.client, self.session), {"plugins": []})
+            self.assertNotIn("conversation.history", [call.args[1]["operation"] for call in self.runner.call.await_args_list])
+        self.runner.call.reset_mock()
+        self.target.user_ref = "foreign"
+        with self.assertRaises(HTTPException):
+            await api.request("pc", body, self.client, self.session)
+        self.runner.call.assert_not_awaited()
+
+    async def test_target_directory_excludes_mobile_unknown_and_other_account_sources(self):
+        devices = [Row(id="pc", user_ref="owner", auth_state="active", name="PC", platform="darwin/arm64"),
+                   Row(id="phone", user_ref="owner", auth_state="active", name="Phone", platform="ios"),
+                   Row(id="unknown", user_ref="owner", auth_state="active", name="Unknown", platform="")]
+        nodes = [Row(client_id=device.id, owner_user_id="owner", auth_state="active", management_state="") for device in devices]
+        self.session.scalars = AsyncMock(side_effect=[Row(all=lambda: nodes), Row(all=lambda: devices)])
+        with patch.object(api, "resolve", new=AsyncMock(return_value=(devices[0], self.runner))) as resolve:
+            page = await api.targets(self.client, self.session)
+        self.assertEqual([row["id"] for row in page["items"]], ["pc"])
+        self.assertEqual(resolve.await_count, 1)
+        query = self.session.scalars.await_args.args[0]
+        self.assertIn("owner", query.compile().params.values())
+
     async def test_library_requires_updated_selected_desktop_and_keeps_signed_owner(self):
         body = {**self.body, "operation": "library.call", "args": {"action": "list", "body": {}}}
         with self.assertRaises(HTTPException):
             await api.request("pc", body, self.client, self.session)
+
         self.runner.call.assert_not_awaited()
         self.runner.caps.append("desktopLibrary1")
         self.runner.call.return_value = {"ok": True, "data": {"ok": True, "items": []}}
@@ -49,6 +86,20 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
         self.target.user_ref = "someone-else"
         with self.assertRaises(HTTPException):
             await api.request("pc", body, self.client, self.session)
+
+    async def test_account_recovery_returns_only_fixed_receipt_not_desktop_body(self):
+        self.client = self.target
+        self.runner.caps.append("desktopHistory1")
+        receipt = {"ok": True, "durable": True, "id": "migrated-" + "a" * 64, "sha256": "b" * 64, "size": 42}
+        self.runner.call.return_value = {"ok": True, "data": {**receipt,
+            "items": [{"text": "private desktop text"}], "conversation": {"title": "private title"}}}
+        body = {**self.body, "operation": "conversation.history", "args": {
+            "action": "import", "pointer": {"sha256": "b" * 64, "size": 42}}}
+        self.assertEqual(await api.request("pc", body, self.client, self.session), receipt)
+        self.runner.call.return_value["data"]["sha256"] = "c" * 64
+        with self.assertRaises(HTTPException) as rejected:
+            await api.request("pc", body, self.client, self.session)
+        self.assertEqual(rejected.exception.status_code, 409)
 
     async def test_embedded_runner_null_owner_matches_handshake_empty_string(self):
         # Desktop ownership is bound to the authenticated Client. Unlike an
@@ -104,16 +155,13 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(HTTPException): await api.request("pc", body, self.client, self.session)
         self.runner.call.assert_not_awaited()
 
-    async def test_use_receipt_resolves_only_the_selected_owners_source_session(self):
+    async def test_plugin_use_never_queries_or_appends_old_history_projection(self):
         self.runner.call.return_value = {"ok": True, "data": {"sourceSessionId": "native-session"}}
         self.session.scalar = AsyncMock(return_value=Row())
-        with patch("app.api.account_conversations._conversation_json", return_value={"id": "account-session"}):
-            result = await api.request("pc", {**self.body, "operation": "plugin.use"}, self.client, self.session)
-        self.assertEqual(result["conversation"]["id"], "account-session")
-        query = self.session.scalar.call_args.args[0]
-        values = query.compile().params.values()
-        for expected in ("owner", "pc", "native-session"):
-            self.assertIn(expected, values)
+        for actor in (self.client, self.target):
+            result = await api.request("pc", {**self.body, "operation": "plugin.use"}, actor, self.session)
+            self.assertEqual(result, {"sourceSessionId": "native-session"})
+        self.session.scalar.assert_not_awaited()
 
     async def test_desktop_must_present_hub_signed_ticket_bound_to_body_and_account(self):
         await api.request("pc", self.body, self.client, self.session)

@@ -261,11 +261,12 @@ async function setup(options = {}) {
   await win.loadFile(page); await js("localStorage.removeItem('fixtureWorkArchives');Object.keys(fixtureArchives).forEach(key=>delete fixtureArchives[key]);ChatCollaborationStore.remove('draft-1');ChatCollaborationStore.remove('history-session');openComposePanel({newSession:true});void 0;");
   await until("ComposeModelPicker.value().modelName==='fixture-default'", 'initial home model');
   if (!options.defaults) {
+    await click('#cpModelBtn'); await click('[data-model="fixture-chosen"]');
+    await until("ComposeModelPicker.value().modelName==='fixture-chosen'", 'explicit Pi model choice');
     await click('#cpRuntime'); await click('[data-runtime="qwen"]');
     await until("ComposeRuntime.value()==='qwen' && ComposeRuntime.availability()?.ok", 'Qwen selection');
     await js('Promise.resolve(ComposeModelPicker.ready()).then(()=>true)');
-    await click('#cpModelBtn'); await click('[data-model="fixture-chosen"]');
-    await until("ComposeModelPicker.value().modelName==='fixture-chosen'", 'explicit model choice');
+    assert.equal(await js('ComposeModelPicker.value().modelName'), 'fixture-chosen', 'manual runtime switch preserves the Pi selection');
   }
   await selectRequirement();
 }
@@ -694,6 +695,45 @@ app.whenReady().then(async () => {
     assert.equal(state.calls.opens[0].adapterId, 'pi'); assert.equal(state.calls.opens[0].modelName, 'fixture-default');
     assert.equal(state.calls.sends[0].options.taskId, 'ready-existing');
     assert.equal(state.session.sessionId, sessionId); assert.equal(state.calls.creates.length, 0);
+  });
+  for (const outcome of ['compatible', 'cancel', 'replace', 'removed']) await runCase('send during explicit runtime switch: ' + outcome, async () => {
+    await win.loadFile(page);
+    await js('openComposePanel({newSession:true});void 0');
+    await until("ComposeModelPicker.value().modelName==='fixture-default'");
+    await click('#cpModelBtn'); await click('[data-model="fixture-chosen"]');
+    await type('#cpInput', '保留这条草稿');
+    await click('#cpRuntime');
+    await js("slowCatalog=true;document.querySelector('[data-runtime=qwen]').click();void 0");
+    await until('Boolean(pendingCatalog)');
+    await js("document.querySelector('#cpGo').click();void 0");
+    assert.equal(await js('calls.opens.length'), 0);
+    if (outcome !== 'compatible') {
+      await js("catalog.usable=models.filter(row=>row.name!=='fixture-chosen');pendingCatalog();void 0");
+      await until("Boolean(document.querySelector('.cp-switch-model[open]'))");
+      await js('ComposeModelPicker.refresh(true)');
+      assert.equal(await js('ComposeRuntime.value()'), 'pi');
+      assert.equal(await js('ComposeModelPicker.value().modelName'), 'fixture-chosen');
+      if (outcome === 'cancel') {
+        await click('.cp-switch-model .app-confirm-cancel');
+        assert.equal(await js('ComposeRuntime.value()'), 'pi');
+      } else {
+        await js("document.querySelector('.cp-switch-model select').selectedIndex=1");
+        if (outcome === 'removed') await js('catalog.usable=catalog.usable.slice(0,1);void 0');
+        await click('.cp-switch-model .app-confirm-submit');
+        await until('!ComposeRuntime.pendingSelection()');
+        assert.equal(await js('ComposeRuntime.value()'), outcome === 'removed' ? 'pi' : 'qwen');
+        assert.equal(await js('ComposeModelPicker.value().modelName'), outcome === 'removed' ? 'fixture-chosen' : 'fixture-history');
+      }
+      assert.equal(await js('calls.opens.length'), 0);
+      assert.equal(await js("document.querySelector('#cpInput').value"), '保留这条草稿');
+      if (outcome !== 'replace') return;
+      await click('#cpGo');
+    } else {
+      await js('pendingCatalog();void 0');
+    }
+    await until('calls.opens.length===1');
+    assert.equal(await js('calls.opens[0].adapterId'), 'qwen');
+    assert.equal(await js('calls.opens[0].modelName'), outcome === 'compatible' ? 'fixture-chosen' : 'fixture-history');
   });
   await runCase('normal send after the requirement card opens the selected model and Agent', async () => {
     await setup(); await click('#cpGo'); await until('Boolean(pendingParse)', 'parser request');

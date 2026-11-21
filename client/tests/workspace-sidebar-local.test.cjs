@@ -190,6 +190,100 @@ test('account project synchronization exports only the original account bindings
   assert.equal(f.open('b').getAccount().projects.length, 0);
 });
 
+test('cloud-only project synchronization retains native members through remote edits, deletion and restart', async () => {
+  const f = fixture();
+  f.catalog(['native-a']);
+  const store = f.open('a'), id = store.saveProject({ name: 'Mixed', folders: ['/local/work'] });
+  store.fileChat('native-a', id, { id: 'native-a', title: 'Private local title' });
+  store.fileChat('cloud-live', id, { id: 'cloud-live', title: 'Cloud', cloud: true, taskId: 'shared-task' });
+  let remote = [], writes = [];
+  const sync = f.api.projectSync({ store, storage: f.storage, key: key('a'), error: error => { throw error; }, api: {
+    conversationProjects: async () => ({ items: remote }),
+    saveConversationProject: async (projectId, body) => {
+      writes.push(plain(body));
+      const row = { ...body, id: projectId, revision: body.revision + 1 }; remote = [row]; return row;
+    },
+  } });
+  await sync.run();
+  assert.deepEqual(writes[0].chatIds, ['cloud-task:shared-task']);
+  assert.doesNotMatch(JSON.stringify(writes), /native-a|Private local title|local\/work/);
+  remote = [{ ...remote[0], name: 'Shared rename', revision: 2 }];
+  await sync.run();
+  assert.deepEqual(plain(f.open('a').get().projects[0].chatIds), ['native-a', 'cloud-task:shared-task']);
+  remote = [{ ...remote[0], deleted: true, chatIds: [], revision: 3 }];
+  await sync.run(); await sync.run();
+  const retained = f.open('a').get().projects.find(project => project.id === id);
+  assert.deepEqual(plain(retained.chatIds), ['native-a']);
+  assert.deepEqual(plain(retained.folders), ['/local/work']);
+  assert.equal(writes.length, 1, 'A remote deletion cannot republish a device-only group');
+});
+
+test('local project names and legacy device references never leave the desktop', async () => {
+  const f = fixture({ [key('a')]: JSON.stringify(saved()) });
+  f.catalog(['native-a']);
+  const store = f.open('a'), writes = [];
+  store.fileChat('account:foreign', 'project-a', { id: 'account:foreign' });
+  store.fileChat('member:encoded-device', 'project-a', { id: 'member:encoded-device' });
+  store.fileChat('cloud-sync-fake', 'project-a', { id: 'cloud-sync-fake', taskId: 'local-requirement' });
+  store.fileChat('cached-cloud', 'project-a', { id: 'cached-cloud', cloud: true, cached: true, taskId: 'cache-task' });
+  const before = plain(store.get().projects);
+  f.storage.setItem(key('a') + ':sync', JSON.stringify({ 'project-a': {
+    revision: 4, name: 'Local A', hash: JSON.stringify({ name: 'Local A', chatIds: before[0].chatIds, deleted: false }),
+  } }));
+  await f.api.projectSync({ store, storage: f.storage, key: key('a'), error: error => { throw error; }, api: {
+    conversationProjects: async () => ({ items: [] }),
+    saveConversationProject: async (id, body) => { writes.push({ id, body }); return { revision: 5 }; },
+  } }).run();
+  assert.deepEqual(writes, []);
+  assert.deepEqual(plain(store.get().projects), before);
+});
+
+test('a new device imports cloud members without deleting unseen membership or importing native locators', async () => {
+  const f = fixture(), store = f.open('a');
+  f.catalog(['native-a']);
+  const id = store.saveProject({ name: 'Local name' });
+  store.fileChat('native-a', id, { id: 'native-a' });
+  const writes = [];
+  await f.api.projectSync({ store, storage: f.storage, key: key('a'), error: error => { throw error; }, api: {
+    conversationProjects: async () => ({ items: [{ id, name: 'Shared name', revision: 6,
+      chatIds: ['cloud-task:remote-task', 'account:foreign', 'member:foreign', 'foreign-native'] }] }),
+    saveConversationProject: async (id, body) => { writes.push({ id, body }); return { revision: 7 }; },
+  } }).run();
+  assert.deepEqual(writes, []);
+  assert.deepEqual(plain(store.get().projects.find(project => project.id === id).chatIds),
+    ['native-a', 'cloud-task:remote-task']);
+});
+
+test('retired account snapshots never flash before discovery or return through pins and project caches', () => {
+  const retired = [
+    { id: 'acct-old-pinned', title: 'Private other PC pin', adapterId: 'account-sync' },
+    { id: 'copy-old-project', title: 'Private other PC project', adapterId: 'account-sync' },
+    { id: 'acct-old-recent', title: 'Private other PC recent' },
+  ];
+  const native = { id: 'native-offline', title: 'Native offline archive', adapterId: 'pi' };
+  const cloud = { id: 'cloud-sync-retained', title: 'Cloud retained', cloud: true, taskId: 'cloud-task' };
+  const original = JSON.stringify({ version: 1, pins: [retired[0].id, native.id, cloud.id],
+    recent: [retired[2].id], projects: [{ id: 'project-retained', name: 'Local group', chatIds: [retired[1].id] }],
+    archivedProjects: [], rows: [...retired, native, cloud] });
+  const f = fixture({ [key('a')]: original });
+  const visible = store => { const view = store.view([]); return plain([
+    ...view.pinned, ...view.recent, ...view.projects.flatMap(project => project.items),
+  ]).map(row => row.id); };
+  const store = f.open('a');
+  assert.deepEqual(visible(store), [native.id, cloud.id], 'Discovery has not started; account titles must stay hidden');
+  f.catalog([], [], 1);
+  assert.deepEqual(visible(store), [native.id, cloud.id]);
+  assert.deepEqual(visible(f.open('a')), [native.id, cloud.id], 'Reload cannot restore filtered snapshots');
+  assert.equal(f.values.get(key('a')), original, 'Display filtering preserves all stored history metadata');
+  const imported = { ...retired[1], title: 'Explicitly imported copy' };
+  f.catalog([imported.id], [imported], 2);
+  assert.ok(visible(store).includes(imported.id), 'An authorized explicit import remains available');
+  f.api.clearLocalHistory();
+  assert.equal(visible(store).some(id => retired.some(row => row.id === id)), false,
+    'Account-scope reset hides old titles immediately, before the next index arrives');
+  assert.equal(f.values.get(key('a')), original);
+});
+
 test('a matching project ID in another account cannot rename or empty the device group', () => {
   const f = fixture({ [key('a')]: JSON.stringify(saved()) }); f.catalog(['native-a']);
   const a = f.open('a'), b = f.open('b');

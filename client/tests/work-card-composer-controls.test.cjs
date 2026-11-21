@@ -23,6 +23,28 @@ function fixture() {
   for(const name of ['compose-surface','chat-composer-bindings']) vm.runInContext(fs.readFileSync(path.join(__dirname,'../components/panels/'+name+'.js'),'utf8'),g);
   return {ctx,api,calls,g,support,change:value=>changed(value),controls:g.ChatComposerBindings.createDraftControls(ctx)};
 }
+test('a passive ordinary chat chooses available local execution options without saving private work defaults', async () => {
+  const f = fixture();
+  await f.controls.runtimes();
+  f.ctx._ref = 'preview-ref';
+  f.ctx._sessionOptions = { adapterId: 'removed-runner' };
+  f.ctx._snap = { messages: [{ role: 'assistant', text: 'Saved reply' }], localReplica: true,
+    modelSelection: {}, execution: { readOnly: true, canContinueOnDevice: true } };
+  f.ctx._workCards = { ensureDraftSelectionSaved() { throw Error('No write access to another account’s work draft'); } };
+  assert.equal(f.controls.state().adapterId, 'pi');
+  assert.equal(f.controls.state().devicePreview, true);
+  assert.equal(f.controls.state().accessControl.modes.includes('full'), false);
+  assert.equal(await f.controls.chooseAccess('full', 'pi', {}), false);
+  assert.equal(f.controls.selectRuntime('pi').snapshot.messages[0].text, 'Saved reply');
+  const next = f.controls.selectModel('local:replacement', 'Replacement');
+  f.ctx._sessionOptions.modelName = next.selection.name;
+  assert.equal(f.controls.state().selection.name, 'local:replacement', 'Passive snapshots have no runtime model selection');
+  assert.equal(await f.controls.ready(), true);
+  assert.equal(f.ctx._sessionOptions.accessMode, 'readonly', 'A restrictive current-account default must be retained');
+  f.ctx._snap.execution.canContinueOnDevice = false;
+  assert.equal(f.controls.active(), false);
+  assert.equal(f.controls.selectModel('local:replacement').ok, false);
+});
 test('仅表单会话的控件继承系统权限，无需打开执行底座', async()=>{
   const f=fixture();assert.equal(f.controls.state().draftOnly,true);await tick();
   assert.equal(f.controls.state().accessPolicy.mode,'readonly');

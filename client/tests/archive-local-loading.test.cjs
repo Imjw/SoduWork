@@ -6,14 +6,19 @@ function fixture(count, accountRows, beforeLocalPage) {
   let createdRows = 0, user = 'a', releaseRemote;
   class Element {
     constructor() {
-      this.children = []; this.attributes = {}; this.replacements = 0;
+      this.children = []; this.attributes = {}; this.replacements = 0; this.handlers = {};
       this.classList = { add() {}, remove() {}, contains: () => true, toggle() {} };
     }
-    append(...items) { this.children.push(...items); }
+    append(...items) { for (const item of items) { item.parent = this; this.children.push(item); } }
     appendChild(item) { this.append(item); return item; }
     replaceChildren(...items) { this.replacements++; this.children = items; }
     setAttribute(name, value) { this.attributes[name] = value; }
-    addEventListener() {}
+    addEventListener(name, handler) { this.handlers[name] = handler; }
+    click() { return this.handlers.click?.({ stopPropagation() {} }); }
+    remove() { if (this.parent) this.parent.children = this.parent.children.filter(child => child !== this); }
+    showModal() { this.open = true; }
+    close() { this.open = false; }
+    focus() {}
     querySelector() { return null; }
     querySelectorAll() { return []; }
     set className(value) { this._className = value; if (value === 'archive-history-item') createdRows++; }
@@ -21,7 +26,7 @@ function fixture(count, accountRows, beforeLocalPage) {
   }
   const elements = new Map(['archivePanel', 'archiveHistoryList', 'archiveProjectsList', 'archiveHistoryStatus', 'archiveHistoryCount']
     .map(id => [id, new Element()]));
-  const document = { getElementById: id => elements.get(id), createElement: () => new Element(), querySelectorAll: () => [] };
+  const document = { body: new Element(), getElementById: id => elements.get(id), createElement: () => new Element(), querySelectorAll: () => [] };
   const rows = Array.from({ length: count }, (_, index) => ({ id: 'archived-' + index, title: 'Saved ' + index, archived: true, at: count - index }));
   const calls = [], accountCalls = [], listeners = {}, values = new Map();
   const storage = { get length() { return values.size; }, key: index => [...values.keys()][index],
@@ -51,9 +56,104 @@ function fixture(count, accountRows, beforeLocalPage) {
   const context = vm.createContext({ window, document, localStorage: storage, URL, Intl });
   for (const file of ['workspace/workspace-sidebar-state.js', 'archive/archive-history-panel.js'])
     vm.runInContext(fs.readFileSync(path.join(__dirname, '../components', file), 'utf8'), context);
-  return { window, elements, calls, accountCalls, listeners, rows, created: () => createdRows,
+  return { window, document, storage, elements, calls, accountCalls, listeners, rows, created: () => createdRows,
     owner(value) { user = value; }, remote: value => releaseRemote(value) };
 }
+
+test('deleting one of 10020 archives does not refetch the inventory or reconstruct unaffected rows', async () => {
+  const f = fixture(10020), deleted = [];
+  f.window.soduWorkAPI.conversationSession.permanentDeleteHistory = async id => {
+    deleted.push(id); return { ok: true, id, deleted: true };
+  };
+  f.window.openArchiveHistory();
+  await new Promise(resolve => setImmediate(resolve));
+  const list = f.elements.get('archiveHistoryList'), retained = list.children[20];
+  const calls = f.calls.length, created = f.created();
+  const pending = list.children[0].children[1].children[1].click();
+  await f.document.body.children.at(-1).children[0].children[2].children[1].click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.calls.length, calls, 'the acknowledged deletion needs no complete history reread');
+  assert.equal(f.created(), created, 'unaffected conversation rows retain their DOM');
+  assert.equal(list.children.length, 10019);
+  assert.equal(list.children[19], retained);
+  await pending;
+  assert.deepEqual(deleted, ['archived-0']);
+  f.remote({ ok: true, chats: [{ id: 'archived-0', title: 'Stale deleted title', archived: true }] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(list.children.length, 10019, 'an older account reply cannot resurrect the acknowledged deletion');
+});
+
+test('archive deletion confirmation cannot dispatch after the account changes', async () => {
+  const f = fixture(2, []); let deletes = 0;
+  f.window.soduWorkAPI.conversationSession.permanentDeleteHistory = async () => { deletes++; return { ok: true }; };
+  f.window.openArchiveHistory(); await new Promise(resolve => setImmediate(resolve));
+  const pending = f.elements.get('archiveHistoryList').children[0].children[1].children[1].click();
+  f.owner('b');
+  await f.document.body.children.at(-1).children[0].children[2].children[1].click();
+  await pending;
+  assert.equal(deletes, 0);
+});
+
+test('failed deletion keeps the archived row and does not start an unrelated inventory reload', async () => {
+  const f = fixture(2, []);
+  f.window.soduWorkAPI.conversationSession.permanentDeleteHistory = async () => ({ ok: false, reason: 'Fixture access denied' });
+  f.window.openArchiveHistory(); await new Promise(resolve => setImmediate(resolve));
+  const list = f.elements.get('archiveHistoryList'), original = list.children[0], reads = f.calls.length;
+  const pending = original.children[1].children[1].click();
+  await f.document.body.children.at(-1).children[0].children[2].children[1].click(); await pending;
+  assert.equal(list.children[0], original); assert.equal(list.children.length, 2);
+  assert.equal(f.calls.length, reads);
+  assert.equal(f.elements.get('archiveHistoryStatus').textContent, 'Fixture access denied');
+});
+
+function archivedProject(f, ids) {
+  const store = f.window.WorkspaceSidebarState.create(f.window.WorkspaceSidebarState.accountOptions({
+    storage: f.storage, api: f.window.SoduWorkAPI,
+  }));
+  const id = store.saveProject({ name: 'Archived fixture project', folders: [] });
+  for (const chatId of ids) store.move(f.rows.find(row => row.id === chatId), id);
+  store.archiveProject(id);
+  return id;
+}
+
+test('deleting an archived project removes only its acknowledged members without refetching all history', async () => {
+  const f = fixture(20, []), deleted = [];
+  archivedProject(f, ['archived-0', 'archived-1']);
+  f.window.soduWorkAPI.conversationSession.permanentDeleteHistory = async id => {
+    deleted.push(id); return { ok: true, id, deleted: true };
+  };
+  f.window.openArchiveHistory(); await new Promise(resolve => setImmediate(resolve));
+  const list = f.elements.get('archiveHistoryList'), retained = list.children[10], reads = f.calls.length;
+  const projectList = f.elements.get('archiveProjectsList');
+  assert.equal(projectList.children.length, 1);
+  const pending = projectList.children[0].children[1].children[1].click();
+  await f.document.body.children.at(-1).children[0].children[2].children[1].click(); await pending;
+  assert.deepEqual(deleted, ['archived-0', 'archived-1']);
+  assert.equal(f.calls.length, reads);
+  assert.equal(list.children.length, 18);
+  assert.equal(list.children[8], retained);
+  assert.equal(projectList.children.filter(row => row.className === 'archive-history-item').length, 0);
+});
+
+test('an account change during project deletion prevents subsequent member dispatch and ignores the old receipt', async () => {
+  const f = fixture(3, []), deleted = []; let release;
+  archivedProject(f, ['archived-0', 'archived-1']);
+  f.window.soduWorkAPI.conversationSession.permanentDeleteHistory = id => {
+    deleted.push(id); return new Promise(resolve => { release = () => resolve({ ok: true, id, deleted: true }); });
+  };
+  f.window.openArchiveHistory(); await new Promise(resolve => setImmediate(resolve));
+  const pending = f.elements.get('archiveProjectsList').children[0].children[1].children[1].click();
+  await f.document.body.children.at(-1).children[0].children[2].children[1].click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(deleted, ['archived-0']);
+  f.owner('b'); f.listeners['soduwork-data-scope-changed']();
+  await new Promise(resolve => setImmediate(resolve));
+  const list = f.elements.get('archiveHistoryList'), currentRows = list.children.slice();
+  release(); await pending;
+  assert.deepEqual(deleted, ['archived-0']);
+  assert.deepEqual(list.children, currentRows);
+  assert.equal(list.children.length, 3, 'The late old-account receipt cannot mutate the new view');
+});
 
 test('large local archives remain searchable without waiting for cloud history or repainting every page', async () => {
   const f = fixture(10020);

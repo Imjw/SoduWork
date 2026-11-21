@@ -58,7 +58,24 @@ async function _attachmentImage(handle, ref, token) {
 }
 
 
-  ipcMain.handle('pi-session-outputs', async (event, ref) => { const s = session.get(ref); if (!s) return { ok: false, reason: '\u4f1a\u8bdd\u4e0d\u5728\u4e86' }; try { const { got, delivery, items } = await artifactRuntime.snapshotAsync(await resolveSession(s)); const artifacts = await artifactRuntime.decorateForSharing(ref, { items }); return { ok: true, files: got.files || [], deliverables: delivery.items || [], artifacts, delivery, cloudOutputs: got.cloudOutputs, truncated: Boolean(got.truncated) }; } catch (e) { return { ok: false, reason: String((e && e.message) || e) }; } });
+  ipcMain.handle('pi-session-outputs', async (event, ref) => {
+    const original = session.get(ref);
+    if (!original) return { ok: false, reason: '会话不在了' };
+    try {
+      const handle = await resolveSession(original);
+      const { got, delivery, items } = await artifactRuntime.snapshotAsync(handle);
+      if (handle.historyArtifacts) {
+        const artifacts = artifactRuntime.decorate(ref, { items });
+        const primary = new Set(delivery.items.map(item => item.artifactId));
+        const deliverables = artifacts.filter(item => primary.has(item.artifactId));
+        await handle.historyArtifacts.authorize();
+        return { ok: true, files: [], deliverables, artifacts, delivery: { ...delivery, items: deliverables }, truncated: false };
+      }
+      const artifacts = await artifactRuntime.decorateForSharing(ref, { items });
+      return { ok: true, files: got.files || [], deliverables: delivery.items || [], artifacts, delivery,
+        cloudOutputs: got.cloudOutputs, truncated: Boolean(got.truncated) };
+    } catch (error) { return { ok: false, reason: String(error.message || error) }; }
+  });
 
   ipcMain.handle('mate-message-pick-folder', mateMessageIpc.createPickFolderHandler({ BrowserWindow, dialog, shareArchive }));
   ipcMain.handle('pi-session-artifact-action', async (event, ref, artifactId, action) => {

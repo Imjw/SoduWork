@@ -45,6 +45,7 @@ function create({ app, identityOf, conversation, pluginStore = plugins, fetchCat
     await guard(true);
     const args = body.args;
     if (body.operation === 'conversation.history') {
+      if (args.action !== 'import') throw Error('请通过设备直连读取本机历史');
       if (typeof conversation.history !== 'function') throw Error('请更新并重启这台电脑的 SoduWork');
       const result = await conversation.history(args, guard);
       await guard(true);

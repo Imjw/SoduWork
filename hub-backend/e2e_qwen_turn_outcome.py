@@ -185,6 +185,9 @@ def run_case(args, root: Path, scenario: str) -> dict:
                                "created": 1, "model": MODEL,
                                "choices": [{"index": 0, "delta": change, "finish_reason": reason}]}
                               for change, reason in ((delta, None), ({}, finish))]
+                    if scenario == "stop":
+                        frames.append({**frames[-1], "choices": [], "usage": {
+                            "prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}})
                     raw = ("".join("data: " + json.dumps(frame) + "\n\n" for frame in frames)
                            + "data: [DONE]\n\n").encode()
                     self.send_response(200)
@@ -287,6 +290,10 @@ def run_case(args, root: Path, scenario: str) -> dict:
             resume.assert_not_called()
         steps = [event.get("part", {}).get("reason") for event in events
                  if event.get("type") == "step_finish" and not event.get("contextOnly")]
+        if scenario == "stop":
+            assert run.get("usage", {}).get("total") == 14
+        else:
+            assert not run.get("usage", {}).get("total"), "Provider sent no usage for this fixture"
         if scenario in {"explicit-limit", "recovery-exhausted", "truncated-tool"}:
             assert replies and replies[-1].get("stopReason") == "max_tokens", (scenario, replies, failure)
             assert replies[-1].get("_meta", {}).get("soduwork", {}).get("outputLimit") is True

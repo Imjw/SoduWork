@@ -564,6 +564,12 @@ const soduWorkBridge = {
    * runtime access and credentials and batch event publication.
    */
   conversationSession,
+  deviceDirect: {
+    ...Object.fromEntries(['status', 'listen', 'stop', 'offer', 'connect', 'peers', 'disconnect']
+      .map(action => [action, input => ipcRenderer.invoke('device-direct-' + action, input || {})])),
+    migration: Object.fromEntries(['preview', 'start', 'status', 'resume', 'cancel']
+      .map(action => [action, input => ipcRenderer.invoke('device-migration-' + action, input || {})])),
+  },
   workPreviewAppHost,
   fileTypeIcon: (type) => ipcRenderer.invoke('file-type-icon', type),
   piSession: conversationSession,
